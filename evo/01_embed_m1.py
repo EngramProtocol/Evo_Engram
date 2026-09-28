@@ -47,8 +47,11 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--tag", required=True, help="hậu tố file, vd bgebase")
     ap.add_argument("--data-dir", default="data")
-    ap.add_argument("--batch", type=int, default=64)
-    ap.add_argument("--max-seq", type=int, default=512)
+    ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--max-seq", type=int, default=0,
+                    help="0 = giữ mặc định của model, đúng như đã làm cho M0")
+    ap.add_argument("--device", default=None,
+                    help="cpu | cuda | None = tự chọn")
     ap.add_argument("--query-prefix", default=None)
     ap.add_argument("--passage-prefix", default=None)
     a = ap.parse_args()
@@ -74,8 +77,21 @@ def main():
     qp, pp = pick_prefix(a.model, a.query_prefix, a.passage_prefix)
     print(f"model={a.model}\nquery_prefix={qp!r}  passage_prefix={pp!r}")
 
-    m = SentenceTransformer(a.model)
-    m.max_seq_length = a.max_seq
+    m = SentenceTransformer(a.model, device=a.device)
+    if a.max_seq:
+        m.max_seq_length = a.max_seq
+    dev = str(m.device)
+    log_n = 200
+    print(f"device={dev}  max_seq={m.max_seq_length} (mặc định của model)")
+    if dev.startswith("cpu"):
+        import time as _t
+        _s = _t.time()
+        m.encode([pp + t for t in texts[:log_n]], batch_size=a.batch,
+                 normalize_embeddings=True, convert_to_numpy=True)
+        rate = log_n / (_t.time() - _s)
+        print(f"tốc độ đo được: {rate:.1f} doc/s  ->  dự kiến "
+              f"{(len(texts)+len(queries))/rate/60:.0f} phút cho toàn bộ")
+        print("chạy trong tmux nếu con số này lớn\n")
 
     E = m.encode([pp + t for t in texts], batch_size=a.batch,
                  normalize_embeddings=True, show_progress_bar=True,
