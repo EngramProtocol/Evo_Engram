@@ -212,8 +212,13 @@ def main():
         # cần nhiều bảng hơn mặc định -> sinh lại bằng cùng seed, cùng phân phối Achlioptas
         rng = np.random.RandomState(args.seed)
         n_draw = max(args.num_tables, args.table_pool)
-        _pool = [rng.choice([0, 1, -1], size=(E.shape[1], 160), p=[2/3, 1/6, 1/6])
-                 for _ in range(n_draw)]
+        def _draw():
+            M = rng.choice([0, 1, -1], size=(E.shape[1], 160),
+                           p=[2/3, 1/6, 1/6]).astype(np.float32)
+            nrm = np.linalg.norm(M, axis=0, keepdims=True)
+            nrm[nrm == 0] = 1.0
+            return M / nrm
+        _pool = [_draw() for _ in range(n_draw)]
         if n_draw > args.num_tables:
             # OVER-DRAW AND SELECT: rút nhiều ma trận hơn cần, giữ những cái có
             # tỉ lệ trùng prefix cao nhất trên một tập query HIỆU CHUẨN TÁCH RIÊNG.
