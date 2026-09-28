@@ -1,0 +1,378 @@
+"""V-Engram — mô phỏng đầy đủ (SimPy): discovery + payload + latency.
+
+Chạy:
+  python main_simulation.py --dataset code --nq 100
+  python main_simulation.py --dataset code --nq 100 --random-routing   # baseline
+  python main_simulation.py --dataset scifact --k-query 20 --multi-probe 3
+
+Sửa so với bản cũ:
+  1. Đường dẫn data mới (file cũ embeddings_20k.npy/faiss_absolute_baseline.json đã bị xoá)
+  2. Dùng query_embeddings.npy PRECOMPUTED thay vì model.encode()
+     -> bản cũ KHÔNG normalize query, trong khi corpus embeddings và PQ codebook
+        đều train trên vector norm=1 => khoảng cách ADC bị lệch. Đây là lỗi ngầm.
+     -> đồng thời khỏi nạp model bge 1.3GB mỗi lần chạy.
+  3. Tham số hoá r / K / T qua dòng lệnh để sweep
+  4. Báo cáo Recall@5/10 thay vì chỉ Success@5 (bão hoà ở 100%)
+"""
+import argparse
+import json
+
+import os as _os
+import numpy as np
+import simpy
+
+from src.network import (
+    bootstrap_network,
+    data_ingestion_process,
+    query_pipeline_process,
+    reset_global_metadata_dht,
+)
+from src.evaluation import stage5_metrics_collection, export_comparison_report, test_data_integrity
+import src.network as netmod
+from src.routing import initialize_lsh_projections
+
+# Biến thể PQ. main_simulation.py trước đây HARDCODE bản không suffix, tức
+# m=256, trong khi main_simulation_v2.py chạy m=512 và bài mô tả m=512. Hai nửa
+# bài vì thế dùng hai quantizer khác nhau. Mặc định giờ là m512 cho khớp bài.
+PQ_VARIANT = _os.environ.get("PQ_VARIANT", "m512")
+_PQSFX = f"_{PQ_VARIANT}" if PQ_VARIANT and PQ_VARIANT != "m256" else ""
+
+DATASETS = {
+    "code":    {"emb": "./data/code_corpus_embeddings.npy",
+                "q":   "./data/code_query_embeddings.npy",
+                "pq":  f"./data/code_pq_codes{_PQSFX}.npy",
+                "cb":  f"./data/code_pq_codebook{_PQSFX}.npy",
+                "gt":  "./data/code_ground_truth.json",
+                "n":   20000},
+    "scifact": {"emb": "./data/scifact_corpus_embeddings.npy",
+                "q":   "./data/scifact_query_embeddings.npy",
+                "pq":  f"./data/scifact_pq_codes{_PQSFX}.npy",
+                "cb":  f"./data/scifact_pq_codebook{_PQSFX}.npy",
+                "gt":  "./data/scifact_ground_truth.json",
+                "n":   5183},
+    "squad":   {"emb": "./data/squad_corpus_embeddings.npy",
+                "q":   "./data/squad_query_embeddings.npy",
+                "pq":  f"./data/squad_pq_codes{_PQSFX}.npy",
+                "cb":  f"./data/squad_pq_codebook{_PQSFX}.npy",
+                "gt":  "./data/squad_ground_truth.json",
+                "n":   18891},
+}
+
+SHARDS_PER_FILE = 30
+K_SIZE = 20
+
+
+def run_simulation(env, args, cfg):
+    codebook = np.load(cfg["cb"])
+    Q = np.load(cfg["q"])                      # (500, 1024) ĐÃ normalize
+    with open(cfg["gt"], "r", encoding="utf-8") as f:
+        ground_truth = json.load(f)
+
+    print(f"[*] {args.dataset}: corpus={cfg['n']:,} | codebook={codebook.shape} | "
+          f"query={Q.shape}")
+    from src.routing import NUM_PROJECTIONS as _L
+    print(f"[*] Cấu hình: r={netmod.METADATA_ANCHORS} K={args.k_query} "
+          f"T={args.multi_probe} L={_L} seed={args.seed}"
+          f"{' [RANDOM ROUTING]' if args.random_routing else ''}")
+
+    network_nodes = yield env.process(bootstrap_network(env, args.nodes, K_SIZE))
+    from src import routing as _rt
+    _rt._ALL_NODES = network_nodes
+
+    yield env.process(data_ingestion_process(
+        env, network_nodes, args.num_files, SHARDS_PER_FILE,
+        embeddings_path=cfg["emb"], pq_codes_path=cfg["pq"],
+        data_label=args.dataset.upper()))
+
+    # Metadata load — số cho mục 4.x Metadata Load Distribution
+    meta = np.array([len(n.RAM_Index) for n in network_nodes])
+    x = np.sort(meta.astype(float))
+    gini = float((2 * np.arange(1, len(x) + 1) - len(x) - 1) @ x / (len(x) * x.sum())) \
+        if x.sum() > 0 else 0.0
+    print(f"\n[METADATA LOAD] mean={meta.mean():.1f} P95={np.percentile(meta,95):.0f} "
+          f"P99={np.percentile(meta,99):.0f} max={meta.max()} Gini={gini:.3f} "
+          f"| tổng={meta.sum():,} bản")
+
+    for doc_id in [12, 99, 256, 512, 1024, 2048, 4096, 8192, 12345, 19999]:
+        if doc_id < args.num_files:
+            test_data_integrity(network_nodes, test_doc_id=doc_id)
+
+    n_run = min(args.nq, len(ground_truth))
+    test_results, uniq_cands, all_stats = [], [], []
+    for item in ground_truth[:n_run]:
+        q_id = item["query_id"]
+        query_vector = Q[q_id - 1]             # precomputed, đã normalize
+
+        retrieved_tags, hops, n_uniq, stats = yield env.process(
+            query_pipeline_process(env, network_nodes, query_vector, codebook,
+                                   target_k=args.target_k,
+                                   k_query=args.k_query,
+                                   multi_probe=args.multi_probe,
+                                   random_routing=args.random_routing,
+                                   verbose=args.verbose))
+        uniq_cands.append(n_uniq)
+        all_stats.append(stats)
+        test_results.append({"query_id": q_id, "retrieved": retrieved_tags, "hops": hops})
+        if not args.verbose and len(test_results) % 10 == 0:
+            print(f"    {len(test_results)}/{n_run} query xong")
+
+    m = stage5_metrics_collection(env, network_nodes, test_results,
+                                  ground_truth_path=cfg["gt"])
+
+    print("\n" + "=" * 64)
+    print(f"KẾT QUẢ | {args.dataset} | r={netmod.METADATA_ANCHORS} K={args.k_query} "
+          f"T={args.multi_probe}{' [RANDOM]' if args.random_routing else ''}")
+    print("=" * 64)
+    if m:
+        print(f"  Hit@5      : {m.get('hit_at_5', 0):.1f}%   (bão hoà — không dùng để so cấu hình)")
+        print(f"  Recall@5   : {m.get('recall_at_5', 0):.1f}%   <- metric chính")
+        print(f"  Recall@10  : {m.get('recall_at_10', 0):.1f}%")
+        print(f"  GT thu hồi : {m.get('mean_gt_recovered', 0):.2f}/5 mỗi query")
+        print(f"  MRR@5      : {m.get('mrr_score', 0):.4f}")
+    print(f"  Rounds/query   : {np.mean([s['rounds'] for s in all_stats]):.1f}")
+    print(f"  RPC/query      : {np.mean([s['rpcs'] for s in all_stats]):.1f}")
+
+    # ===== MỤC 5: BẢNG CHI PHÍ ĐẦY ĐỦ =====
+    def _q(key, p):
+        return np.percentile([s.get(key, 0) for s in all_stats], p)
+
+    def _m(key):
+        return np.mean([s.get(key, 0) for s in all_stats])
+
+    print()
+    print("=" * 78)
+    print("BẢNG CHI PHÍ (mục 5) — tách Discovery / Payload / Total")
+    print("=" * 78)
+    print(f"{'Đại lượng':28s} {'Discovery':>13s} {'Payload':>13s} {'Total':>13s}")
+    print("-" * 78)
+    print(f"{'Routing rounds/query':28s} {_m('disc_rounds'):>13.1f} "
+          f"{_m('pay_rounds'):>13.1f} {_m('disc_rounds')+_m('pay_rounds'):>13.1f}")
+    print(f"{'RPC/query':28s} {_m('disc_rpcs'):>13.1f} "
+          f"{_m('pay_rpcs'):>13.1f} {_m('disc_rpcs')+_m('pay_rpcs'):>13.1f}")
+    print(f"{'Bytes/query':28s} {_m('disc_bytes'):>13,.0f} "
+          f"{_m('pay_bytes'):>13,.0f} {_m('disc_bytes')+_m('pay_bytes'):>13,.0f}")
+    print(f"{'Unique nodes contacted':28s} {_m('contacted_nodes'):>13.1f} "
+          f"{'--':>13s} {_m('contacted_nodes'):>13.1f}")
+    print(f"{'Candidate tags moved':28s} {_m('candidate_tags'):>13.1f} "
+          f"{'--':>13s} {_m('candidate_tags'):>13.1f}")
+    print(f"{'Unique candidates':28s} {_m('unique_candidates'):>13.1f} "
+          f"{'--':>13s} {_m('unique_candidates'):>13.1f}")
+    print("-" * 78)
+    print(f"{'Latency p50 (ms)':28s} {'':>13s} {'':>13s} {_q('latency_ms',50):>13.0f}")
+    print(f"{'Latency p95 (ms)':28s} {'':>13s} {'':>13s} {_q('latency_ms',95):>13.0f}")
+    print(f"{'Latency p99 (ms)':28s} {'':>13s} {'':>13s} {_q('latency_ms',99):>13.0f}")
+    print("=" * 78)
+    print("  Lưu ý: 'rounds' cộng dồn qua L×T lookup CHẠY SONG SONG, nên nó là tổng")
+    print("  công, KHÔNG phải đường tới hạn. Latency mới phản ánh thời gian thực tế.")
+
+    # ===== MỤC 21: % LOOKUP CHẠM R_max =====
+    tot = sum(s.get('lookups_total', 0) for s in all_stats)
+    cap = sum(s.get('lookups_at_cap', 0) for s in all_stats)
+    rmax = all_stats[0].get('r_max', '?') if all_stats else '?'
+    q_any_cap = sum(1 for s in all_stats if s.get('lookups_at_cap', 0) > 0)
+    print()
+    print(f"[MỤC 21] R_max = {rmax}")
+    print(f"  Lookup chạm trần : {cap:,}/{tot:,} ({100.0*cap/max(1,tot):.1f}%)")
+    print(f"  Query có >=1 lookup chạm trần: {q_any_cap}/{len(all_stats)} "
+          f"({100.0*q_any_cap/max(1,len(all_stats)):.1f}%)")
+    print(f"  => Nếu tỉ lệ cao, R_max đang CẮT lookup trước khi hội tụ; recall báo")
+    print(f"     cáo là dưới trần đó, không phải của thuật toán hội tụ đầy đủ.")
+    print(f"  Node chạm/query: {np.mean([s['contacted_nodes'] for s in all_stats]):.1f} "
+          f"({100*np.mean([s['contacted_nodes'] for s in all_stats])/args.nodes:.1f}% mạng)")
+    print(f"  Candidate/query: {np.mean(uniq_cands):.0f} "
+          f"({100*np.mean(uniq_cands)/args.num_files:.2f}% corpus)")
+    print(f"  Metadata Gini  : {gini:.3f}")
+
+    out = {"dataset": args.dataset, "seed": args.seed, "nodes": args.nodes,
+           "r": netmod.METADATA_ANCHORS, "k_query": args.k_query,
+           "multi_probe": args.multi_probe, "random_routing": args.random_routing,
+           "n_query": n_run,
+           # --- MC10: chẩn đoán đặt/lấy payload ---
+           "parallel_adc": netmod.PARALLEL_ADC,
+           # --- chẩn đoán cơ chế (yêu cầu đo thêm của thầy) ---
+           # jaccard_mean : độ trùng TRUNG BÌNH giữa peer set của các cặp probe.
+           #                THẤP = độ đa dạng CAO.
+           # xor_rank_mean: thứ hạng XOR trung bình của peer trả về. Thấp = gần
+           #                tập XOR-gần nhất toàn cục.
+           **_probe_diag_summary(),
+           # reachable Recall@5: bao nhiêu phần trăm ground-truth top-5 nằm
+           # trong tập ứng viên gom được, TRƯỚC bước rerank PQ. Tách được mất
+           # mát do ĐỊNH TUYẾN khỏi mất mát do LƯỢNG TỬ HOÁ.
+           "reachable_recall5": _compute_reachable(args.dataset),
+           "stop_rule": __import__("src.routing", fromlist=["x"]).STOP_RULE,
+           "frontier_scope": __import__("src.routing", fromlist=["x"]).FRONTIER_SCOPE,
+           "overlap_mean": (float(np.mean(__import__("src.routing", fromlist=["x"])._OVERLAP_STATS))
+                            if __import__("src.routing", fromlist=["x"])._OVERLAP_STATS else None),
+           "placement_mode": netmod.PLACEMENT_MODE,
+           "placement_k": netmod.PLACEMENT_K,
+           "fetch_top": netmod.FETCH_TOP,
+           "probe_depth_mean": float(np.mean([s.get("probe_depth_mean",0) for s in all_stats])) if all_stats else 0.0,
+           "probe_depth_p95": float(np.mean([s.get("probe_depth_p95",0) for s in all_stats])) if all_stats else 0.0,
+           "probe_depth_max": max([s.get("probe_depth_max",0) for s in all_stats], default=0),
+           "shards_found": int(sum(s.get("shards_found",0) for s in all_stats)),
+           "shard_misses": int(sum(s.get("shard_misses",0) for s in all_stats)),
+           "hit_at_5": m.get("hit_at_5") if m else None,
+           "recall_at_5": m.get("recall_at_5") if m else None,
+           "recall_at_10": m.get("recall_at_10") if m else None,
+           "mrr": m.get("mrr_score") if m else None,
+           "mean_rounds": float(np.mean([s["rounds"] for s in all_stats])),
+           "mean_rpcs": float(np.mean([s["rpcs"] for s in all_stats])),
+           "disc_rounds": float(np.mean([s.get("disc_rounds",0) for s in all_stats])),
+           "disc_rpcs": float(np.mean([s.get("disc_rpcs",0) for s in all_stats])),
+           "disc_bytes": float(np.mean([s.get("disc_bytes",0) for s in all_stats])),
+           "pay_rounds": float(np.mean([s.get("pay_rounds",0) for s in all_stats])),
+           "pay_rpcs": float(np.mean([s.get("pay_rpcs",0) for s in all_stats])),
+           "pay_bytes": float(np.mean([s.get("pay_bytes",0) for s in all_stats])),
+           "candidate_tags": float(np.mean([s.get("candidate_tags",0) for s in all_stats])),
+           "latency_p50": float(np.percentile([s.get("latency_ms",0) for s in all_stats], 50)),
+           "latency_p95": float(np.percentile([s.get("latency_ms",0) for s in all_stats], 95)),
+           "latency_p99": float(np.percentile([s.get("latency_ms",0) for s in all_stats], 99)),
+           "r_max": all_stats[0].get("r_max", 15) if all_stats else 15,
+           "lookups_total": int(sum(s.get("lookups_total",0) for s in all_stats)),
+           "lookups_at_cap": int(sum(s.get("lookups_at_cap",0) for s in all_stats)),
+           "mean_contacted": float(np.mean([s["contacted_nodes"] for s in all_stats])),
+           "mean_candidates": float(np.mean(uniq_cands)),
+           "metadata_gini": gini, "metadata_total": int(meta.sum())}
+    from src.routing import DEFAULT_R_MAX as _RMAX, NUM_PROJECTIONS as _L
+    fn = args.out or (f"result_full_{args.dataset}_N{args.nodes}_L{_L}"
+                      f"_r{netmod.METADATA_ANCHORS}_K{args.k_query}_T{args.multi_probe}"
+                      f"_Rmax{_RMAX}"
+                      f"{'_par' if netmod.PARALLEL_FETCH else '_ser'}"
+                      f"{'_padc' if netmod.PARALLEL_ADC else '_sadc'}"
+                      # LỖI LẶP LẠI LẦN THỨ NĂM: mọi tham số được sweep PHẢI có
+                      # trong tên file. Thiếu STOP_RULE/FRONTIER_SCOPE thì bốn
+                      # cấu hình 2x2 ghi đè lên nhau và số đọc ra là của lần
+                      # chạy cuối, không phải của cấu hình đang xét.
+                      f"_{_rt.STOP_RULE}-{_rt.FRONTIER_SCOPE}"
+                      f"{'_nopay' if netmod.SKIP_PAYLOAD else ''}"
+                      f"_{netmod.ROUTING_MODE if netmod.ROUTING_MODE != 'auto' else ('random_slots' if args.random_routing else 'semantic')}"
+                      f"_{netmod.PLACEMENT_MODE}{netmod.PLACEMENT_K}"
+                      f"{'_top' + str(netmod.FETCH_TOP) if netmod.FETCH_TOP else ''}"
+                      f"_s{args.seed}_nq{n_run}.json")
+    # BUG cũ: bản vá tên file trước đây tính fn rồi BỎ ĐÓ, không ghi gì.
+    # Mọi run SimPy từ đó tới nay không sinh file JSON nào.
+    import json as _json
+    with open(fn, "w") as _f:
+        _json.dump(out, _f, indent=2, default=float)
+    print(f"\n-> Lưu: {fn}")
+
+
+def _compute_reachable(dataset):
+    """reachable Recall@5: bao nhiêu phần trăm ground-truth top-5 nằm trong tập
+    ứng viên đã gom, TRƯỚC bước rerank PQ.
+
+    Tách mất mát do ĐỊNH TUYẾN khỏi mất mát do LƯỢNG TỬ HOÁ — đại lượng thầy
+    yêu cầu đo. Tự nạp ground truth vì hàm chạy ngoài phạm vi của main.
+    """
+    from src import network as _nm
+    diag = getattr(_nm, "_PROBE_DIAG", [])
+    if not diag:
+        return None
+    try:
+        with open(f"./data/{dataset}_ground_truth.json") as fh:
+            gt = json.load(fh)
+    except Exception:
+        return None
+    out = []
+    for qi, q in enumerate(diag):
+        tags = q.get("reachable_tags")
+        if tags is None or qi >= len(gt):
+            continue
+        # Tag trong mô phỏng là chuỗi "doc_<index>", ground truth dùng số
+        # nguyên. Chuẩn hoá về số để so được.
+        def _idx(x):
+            if isinstance(x, str) and x.startswith("doc_"):
+                return int(x[4:])
+            try:
+                return int(x)
+            except (TypeError, ValueError):
+                return None
+        g5 = {int(r["index"]) for r in gt[qi]["top_5_results"][:5]}
+        tags = {i for x in tags if (i := _idx(x)) is not None}
+        if g5:
+            out.append(len(g5 & tags) / len(g5))
+    return float(np.mean(out)) * 100 if out else None
+
+def _probe_diag_summary():
+    """Tóm tắt chẩn đoán peer set của các probe.
+
+    Ba đại lượng thầy yêu cầu đo:
+      - Jaccard giữa peer set của từng cặp probe  -> độ ĐA DẠNG
+      - số ứng viên duy nhất                      -> đã có sẵn ở nơi khác
+      - thứ hạng XOR trung bình của peer trả về   -> độ TRUNG THỰC
+    """
+    import itertools
+    from src import network as _nm
+    diag = getattr(_nm, "_PROBE_DIAG", [])
+    if not diag:
+        return {}
+    jac, ranks, ncand = [], [], []
+    for q in diag:
+        if q.get("n_unique_cand") is not None:
+            ncand.append(q["n_unique_cand"])
+        ps = [x for x in q.get("peersets", []) if x]
+        # JACCARD: trung bình trên MỌI cặp probe của một query, rồi trung bình
+        # qua các query. Bản trước lấy 200 cặp ĐẦU của
+        # itertools.combinations, sinh theo thứ tự từ điển, nên probe 0 vào 39
+        # cặp còn probe 39 chỉ vào 5 cặp — thiên lệch nặng và không tái tạo
+        # được. Đây là mục 1 của thầy. Với 40 probe chỉ có 780 cặp nên tính
+        # hết không tốn kém.
+        qjac = []
+        for i, j in itertools.combinations(range(len(ps)), 2):
+            u = len(ps[i] | ps[j])
+            if u:
+                qjac.append(len(ps[i] & ps[j]) / u)
+        if qjac:
+            jac.append(sum(qjac) / len(qjac))     # một giá trị cho mỗi query
+        ranks.extend(q.get("xor_ranks", []))
+    out = {}
+    if jac:
+        out["jaccard_mean"] = float(np.mean(jac))
+        out["jaccard_max"] = float(np.max(jac))
+    if ranks:
+        out["xor_rank_mean"] = float(np.mean(ranks))
+        out["xor_rank_p90"] = float(np.percentile(ranks, 90))
+    if ncand:
+        out["n_unique_cand_mean"] = float(np.mean(ncand))
+    # TÁCH RPC theo loại — mục 1 và 6 của thầy: routing RPC (FIND_NODE) và
+    # candidate-evaluation RPC (một request mỗi peer mới chạm) phải báo cáo
+    # riêng, không gộp thành một cột.
+    rt = [q.get("rpcs_routing") for q in diag if q.get("rpcs_routing") is not None]
+    ce = [q.get("rpcs_eval") for q in diag if q.get("rpcs_eval") is not None]
+    if rt:
+        out["rpc_routing_mean"] = float(np.mean(rt))
+    if ce:
+        out["rpc_eval_mean"] = float(np.mean(ce))
+    return out
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", default="code", choices=list(DATASETS))
+    ap.add_argument("--nodes", type=int, default=10000)
+    ap.add_argument("--num-files", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=20235956)
+    ap.add_argument("--k-query", type=int, default=20, help="K — node mỗi bảng")
+    ap.add_argument("--multi-probe", type=int, default=3, help="T — prefix mỗi bảng")
+    ap.add_argument("--meta-anchors", type=int, default=None, help="r — ghi đè METADATA_ANCHORS")
+    ap.add_argument("--target-k", type=int, default=10)
+    ap.add_argument("--nq", type=int, default=100)
+    ap.add_argument("--random-routing", action="store_true")
+    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--out", default=None)
+    args = ap.parse_args()
+
+    cfg = DATASETS[args.dataset]
+    if args.num_files is None:
+        args.num_files = cfg["n"]
+    if args.meta_anchors is not None:
+        netmod.METADATA_ANCHORS = args.meta_anchors
+
+    import random as _r
+    _r.seed(args.seed)
+    np.random.seed(args.seed % (2**32))
+    initialize_lsh_projections(args.seed)
+    reset_global_metadata_dht()
+
+    env = simpy.Environment()
+    env.process(run_simulation(env, args, cfg))
+    env.run()
