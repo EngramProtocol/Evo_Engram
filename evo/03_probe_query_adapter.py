@@ -16,10 +16,19 @@ Nhánh (mọi nhánh dùng cùng một chỉ mục E0, trừ oracle):
   A_qry_ridge
   A_gt_doc_ridge     adapter hướng truy hồi: A(e1_i) ~ trung bình E0 của láng giềng M1 của i
   A_gt_qry_ridge     adapter hướng truy hồi trên tập query huấn luyện
+Thêm ở gate 3b:
+  A_fwdT_ridge       chuyển vị của ridge chiều xuôi E0 -> E1 ở gate 2. Vì <q1 W^T, e0> = <q1, e0 W>,
+                     nhánh này chấm đúng điểm của derived record gate 2 mà không tạo record nào
+  A_aff_ridge        ridge chiều ngược có hệ số chặn (trừ trung bình trước khi khớp)
+  A_split            định tuyến bằng A_doc_ridge, xếp hạng ADC bằng A_fwdT_ridge
+Biến thể dùng để so với dual được CHỌN trên validation (các query không thuộc tập đánh giá,
+mà nhánh khớp trên document chưa hề thấy), không chọn trên chính tập đánh giá.
 
 Mỗi nhánh báo cáo: reach, final (ADC trong E0), final sau rerank với R payload,
 số node chạm (= số ADC RPC), số ứng viên reachable, số ứng viên chuyển qua mạng
-sau cắt top-kappa tại node, số payload phải tải.
+sau cắt top-kappa tại node, số payload phải tải. R payload được lấy từ hợp các
+danh sách top-kappa mà từng node trả về, đúng giao thức (R <= kappa không khác
+top-R toàn cục; R > kappa có thể khác, bản top-R toàn cục vẫn ghi ở rerank_nokappa).
 
 Kiểm tra tái lập: dual_encode và oracle_full phải ra đúng số của
 02_probe_bridge.py --cb-train full cùng seed.
@@ -78,15 +87,53 @@ def gt_targets(src_m1, E1, E0, k, exclude_self_idx=None, chunk=256):
 
 
 # ----------------------------------------------------------------- truy hồi trên E0
+def kappa_union(order, anchors, mask, kappa, need):
+    """Danh sách ứng viên client thật sự nhận được, theo đúng giao thức: mỗi node bị chạm
+    chỉ trả top-kappa theo ADC trong số document neo tại nó, client gộp lại và giữ thứ tự
+    ADC. Trả về `need` phần tử đầu. Với R <= kappa kết quả trùng order[:R], vì trước
+    phần tử thứ R chỉ có R-1 < kappa phần tử nên chưa node nào đầy; chỉ R > kappa mới khác."""
+    if need <= kappa:
+        return order[:need]
+    cnt, out = {}, []
+    for doc in order:
+        ok = False
+        for n in set(anchors[:, doc].tolist()):      # một document neo 2 lần tại cùng node chỉ chiếm 1 chỗ
+            if not mask[n]:
+                continue
+            c = cnt.get(n, 0)
+            if c < kappa:
+                ok = True
+            cnt[n] = c + 1
+        if ok:
+            out.append(doc)
+            if len(out) >= need:
+                break
+    return np.asarray(out, dtype=np.int64)
+
+
 def retrieve(qv, anchors, P_list, codes, cb, nid, gt5, K, T, cbits, load,
-             kappa, rerank_vecs, rerank_q, Rs):
-    """Một lượt truy hồi; trả về chỉ số trung bình và final cho từng R."""
+             kappa, rerank_vecs, rerank_q, Rs, exact_vecs=None, rank_qv=None):
+    """Một lượt truy hồi; trả về chỉ số trung bình và final cho từng R.
+    qv              : vector dùng để định tuyến (khoá SRP, chọn node)
+    rank_qv         : vector dùng để xếp hạng ADC; None = dùng chính qv
+    rerank          : R payload lấy từ hợp các top-kappa của từng node (đúng giao thức)
+    rerank_nokappa  : R payload lấy thẳng từ top-R toàn cục của mọi ứng viên reachable
+                      (cách tính của gate 3 đầu tiên, giữ lại để kiểm tái lập)
+    Chẩn đoán trên cùng tập reachable, chỉ khác cách chấm điểm:
+    final_ip        : ADC dạng tích vô hướng thay cho ADC L2
+    final_exact     : tích vô hướng với vector gốc, không qua PQ (cần exact_vecs)"""
     NQ = qv.shape[0]
+    rq_all = qv if rank_qv is None else rank_qv
     pk = pb.probe_keys_for(qv, P_list, T, cbits)
     m = cb.shape[0]
+    Rmax = max(Rs)
+    S_ex = None if exact_vecs is None else rq_all @ exact_vecs.T      # (NQ, N), tính một lần
     reach_hit = np.zeros(NQ); final_hit = np.zeros(NQ)
+    fin_ip = np.zeros(NQ); fin_ex = np.zeros(NQ)
     rr_hit = {R: np.zeros(NQ) for R in Rs}
+    rr_all = {R: np.zeros(NQ) for R in Rs}
     n_nodes = np.zeros(NQ); n_reach = np.zeros(NQ); n_moved = np.zeros(NQ)
+    am = np.arange(m)[None, :]
 
     for qi in range(NQ):
         keys = np.concatenate([pk[l][qi] for l in range(len(P_list))])
@@ -100,18 +147,30 @@ def retrieve(qv, anchors, P_list, codes, cb, nid, gt5, K, T, cbits, load,
         reach_hit[qi] = len(set(reach.tolist()) & g) / 5.0
         if len(reach) == 0:
             continue
-        lut = pb.adc_lut(qv[qi], cb)
-        dist = lut[np.arange(m)[None, :], codes[reach]].sum(1)
+        rq = rq_all[qi]
+        cr = codes[reach]
+        dist = pb.adc_lut(rq, cb)[am, cr].sum(1)
         order = reach[np.argsort(dist)]
         final_hit[qi] = len(set(order[:5].tolist()) & g) / 5.0
+        lut_ip = (rq.reshape(m, -1)[:, None, :] * cb).sum(2)
+        s_ip = lut_ip[am, cr].sum(1)
+        fin_ip[qi] = len(set(reach[np.argsort(-s_ip)[:5]].tolist()) & g) / 5.0
+        if S_ex is not None:
+            s_ex = S_ex[qi, reach]
+            fin_ex[qi] = len(set(reach[np.argsort(-s_ex)[:5]].tolist()) & g) / 5.0
+        korder = kappa_union(order, anchors, mask, kappa, Rmax)
         for R in Rs:
-            cand = order[:R]
-            sim = rerank_vecs[cand] @ rerank_q[qi]
-            top = cand[np.argsort(-sim)[:5]]
-            rr_hit[R][qi] = len(set(top.tolist()) & g) / 5.0
+            for src, acc in ((korder, rr_hit), (order, rr_all)):
+                cand = src[:R]
+                sim = rerank_vecs[cand] @ rerank_q[qi]
+                top = cand[np.argsort(-sim)[:5]]
+                acc[R][qi] = len(set(top.tolist()) & g) / 5.0
 
     return dict(reach_r5=100 * reach_hit.mean(), final_r5=100 * final_hit.mean(),
+                final_ip=100 * fin_ip.mean(),
+                final_exact=(100 * fin_ex.mean()) if S_ex is not None else float("nan"),
                 rerank={str(R): 100 * rr_hit[R].mean() for R in Rs},
+                rerank_nokappa={str(R): 100 * rr_all[R].mean() for R in Rs},
                 nodes=float(n_nodes.mean()), cand=float(n_reach.mean()),
                 moved=float(n_moved.mean()))
 
@@ -183,13 +242,15 @@ def main():
     load0 = np.bincount(anchors0.ravel(), minlength=a.nodes)
     common = dict(anchors=anchors0, P_list=P0, codes=cd0, cb=cb0, nid=nid, gt5=gt5,
                   K=a.k_query, T=a.probes, cbits=a.cbits, load=load0,
-                  kappa=a.kappa, rerank_vecs=E1, rerank_q=Q1[ev], Rs=Rs)
+                  kappa=a.kappa, rerank_vecs=E1, rerank_q=Q1[ev], Rs=Rs, exact_vecs=E0)
 
     results, diag = [], {}
+    docfit = {}       # nhánh chỉ khớp trên document: tên -> (hàm định tuyến, hàm xếp hạng)
 
-    def arm(name, qv, note, extra=None):
-        r = retrieve(qv, **common)
-        r.update(name=name, note=note, nn_overlap=nn_overlap(qv, E0, gt5))
+    def arm(name, qv, note, extra=None, rank_qv=None):
+        r = retrieve(qv, rank_qv=rank_qv, **common)
+        rk = qv if rank_qv is None else rank_qv
+        r.update(name=name, note=note, nn_overlap=nn_overlap(rk, E0, gt5))
         r["q_angle_to_q0"] = float(angles_deg(qv, Q0[ev]).mean())
         if extra:
             r.update(extra)
@@ -210,7 +271,7 @@ def main():
     anchors1 = pb.build_index(E1, P1, nid)
     load1 = np.bincount(anchors1.ravel(), minlength=a.nodes)
     ro = retrieve(l2norm(Q1[ev]), anchors1, P1, cd1, cb1, nid, gt5, a.k_query, a.probes,
-                  a.cbits, load1, a.kappa, E1, Q1[ev], Rs)
+                  a.cbits, load1, a.kappa, E1, Q1[ev], Rs, exact_vecs=E1)
     ro.update(name="oracle_full", note="chỉ mục native E1 (trần tuyệt đối)",
               nn_overlap=float("nan"), q_angle_to_q0=float("nan"))
     results.append(ro)
@@ -223,7 +284,8 @@ def main():
         ok = (abs(de["reach_r5"] - exp["dual_encode"][0]) < 0.15 and
               abs(de["final_r5"] - exp["dual_encode"][1]) < 0.15 and
               abs(ro["final_r5"] - exp["oracle_full"][1]) < 0.15 and
-              ("50" not in de["rerank"] or abs(de["rerank"]["50"] - exp["dual_rerank50"]) < 0.15))
+              ("50" not in de["rerank_nokappa"] or
+               abs(de["rerank_nokappa"]["50"] - exp["dual_rerank50"]) < 0.15))
         log(f"  >>> TÁI LẬP gate trước: {'KHỚP' if ok else 'LỆCH - dừng lại kiểm tra'}")
         diag["reproduced"] = bool(ok)
 
@@ -238,6 +300,41 @@ def main():
             dict(lam=lam, resid_doc=ang_doc, resid_qry=ang_qry))
         log(f"      phần dư: document ngoài mẫu {ang_doc:5.2f}°  |  query {ang_qry:5.2f}°"
             f"  (chênh = độ lệch hình học query/document)")
+        docfit[nm] = (lambda Q, W=W: l2norm(Q @ W), None)
+
+    # ---------------- biến thể khớp trên document, thêm ở gate 3b
+    log("\n--- BIẾN THỂ KHỚP TRÊN DOCUMENT (thêm ở gate 3b) ---")
+    # (a) Chuyển vị ánh xạ xuôi E0 -> E1 của gate 2. Với điểm tích vô hướng,
+    #     <q1 W^T, e0> = <q1, e0 W>, tức đúng điểm của derived record ở gate 2 (trước khi
+    #     chuẩn hoá) nhưng mọi record vẫn là native E0. Khớp y hệt gate 2: cùng S, cùng hàm,
+    #     cùng lưới lambda, cùng cách tách validation.
+    Wf, lam_f = pb.fit_bridge(E0[S], E1[S], "ridge", a.seed)
+    WfT = np.ascontiguousarray(Wf.T)
+    ang_fwd = float(angles_deg(E0[rest] @ Wf, E1[rest]).mean())
+    ang_doc = float(angles_deg(E1[rest] @ WfT, E0[rest]).mean())
+    ang_qry = float(angles_deg(Q1[ev] @ WfT, Q0[ev]).mean())
+    arm("A_fwdT_ridge", l2norm(Q1[ev] @ WfT), "chuyển vị ridge chiều xuôi của gate 2",
+        dict(lam=lam_f, resid_fwd=ang_fwd, resid_doc=ang_doc, resid_qry=ang_qry))
+    log(f"      phần dư chiều xuôi E0->E1 (phải khớp gate 2): {ang_fwd:5.2f}°  |  "
+        f"chiều ngược: document {ang_doc:5.2f}°, query {ang_qry:5.2f}°")
+    docfit["A_fwdT_ridge"] = (lambda Q: l2norm(Q @ WfT), None)
+
+    # (b) Ridge có hệ số chặn (khớp trên dữ liệu đã trừ trung bình). e5 lệch hướng mạnh;
+    #     ánh xạ tuyến tính không có hệ số chặn phải dùng chính trọng số để mang vector trung bình.
+    mu1, mu0 = E1[S].mean(0), E0[S].mean(0)
+    Wc, lam_c, _ = fit_ridge_cv(E1[S] - mu1, E0[S] - mu0, a.seed, (1e-3, 1e-2, 1e-1, 1.0, 10.0))
+    aff = lambda X: (X - mu1) @ Wc + mu0
+    ang_doc = float(angles_deg(aff(E1[rest]), E0[rest]).mean())
+    ang_qry = float(angles_deg(aff(Q1[ev]), Q0[ev]).mean())
+    arm("A_aff_ridge", l2norm(aff(Q1[ev])), "ridge có hệ số chặn",
+        dict(lam=lam_c, resid_doc=ang_doc, resid_qry=ang_qry))
+    log(f"      phần dư: document ngoài mẫu {ang_doc:5.2f}°  |  query {ang_qry:5.2f}°")
+    docfit["A_aff_ridge"] = (lambda Q: l2norm(aff(Q)), None)
+
+    # (c) Tách vai: định tuyến bằng A_doc_ridge (reach tốt), xếp hạng ADC bằng A_fwdT_ridge.
+    arm("A_split", l2norm(Q1[ev] @ Wr), "định tuyến A_doc_ridge, xếp hạng A_fwdT_ridge",
+        rank_qv=l2norm(Q1[ev] @ WfT))
+    docfit["A_split"] = (lambda Q: l2norm(Q @ Wr), lambda Q: l2norm(Q @ WfT))
 
     # ---------------- adapter khớp trên cặp query
     log(f"\n--- ADAPTER KHỚP TRÊN CẶP QUERY ({len(trq)} query huấn luyện -> {d0} chiều) ---")
@@ -255,9 +352,35 @@ def main():
     Tdoc = gt_targets(E1[S], E1, E0, a.gt_k, exclude_self_idx=S)
     Wgd, lam_gd, _ = fit_ridge_cv(E1[S], Tdoc, a.seed, (1e-3, 1e-2, 1e-1, 1.0, 10.0))
     arm("A_gt_doc_ridge", l2norm(Q1[ev] @ Wgd), "document làm pseudo-query", dict(lam=lam_gd))
+    docfit["A_gt_doc_ridge"] = (lambda Q: l2norm(Q @ Wgd), None)
     Tq = l2norm(np.stack([E0[gt5_all[i]].mean(0) for i in trq]).astype(np.float32))
     Wgq, lam_gq, _ = fit_ridge_cv(Q1[trq], Tq, a.seed, (1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0))
     arm("A_gt_qry_ridge", l2norm(Q1[ev] @ Wgq), "query huấn luyện", dict(lam=lam_gq))
+
+    # ---------------- chọn biến thể trên validation
+    # Các nhánh khớp trên document không dùng query nào, nên các query không thuộc tập đánh
+    # giá là validation sạch cho chúng. Chọn theo rerank@vR trên validation rồi mới nhìn
+    # sang tập đánh giá, tránh việc chọn nhánh tốt nhất ngay trên chính tập đánh giá.
+    vR = 20
+    assert len(trq) > 0, "cần query ngoài tập đánh giá để làm validation (giảm --nq)"
+    gt5_tr = [gt5_all[i] for i in trq]
+    vcommon = dict(common, gt5=gt5_tr, rerank_q=Q1[trq], Rs=[vR], exact_vecs=None)
+    log(f"\n--- CHỌN BIẾN THỂ TRÊN VALIDATION ({len(trq)} query không dùng để đánh giá, "
+        f"tiêu chí rerank@{vR}) ---")
+    vd = retrieve(Q0[trq], **vcommon)
+    log(f"  {'dual_encode':18s} val reach={vd['reach_r5']:5.1f} final={vd['final_r5']:5.1f} "
+        f"R{vR}={vd['rerank'][str(vR)]:5.1f}")
+    val = {}
+    for nm, (rf, kf) in docfit.items():
+        rv = retrieve(rf(Q1[trq]), rank_qv=None if kf is None else kf(Q1[trq]), **vcommon)
+        val[nm] = dict(reach=rv["reach_r5"], final=rv["final_r5"], rerank=rv["rerank"][str(vR)])
+        log(f"  {nm:18s} val reach={rv['reach_r5']:5.1f} final={rv['final_r5']:5.1f} "
+            f"R{vR}={rv['rerank'][str(vR)]:5.1f}")
+    sel = max(val, key=lambda k: val[k]["rerank"])
+    log(f"  -> chọn {sel}")
+    diag["val"] = dict(R=vR, n=int(len(trq)), selected=sel, arms=val,
+                       dual=dict(reach=vd["reach_r5"], final=vd["final_r5"],
+                                 rerank=vd["rerank"][str(vR)]))
 
     # ---------------- tổng kết
     get = lambda n: next(r for r in results if r["name"] == n)
@@ -280,6 +403,26 @@ def main():
         f"chênh dual {best_fin['final_r5'] - de['final_r5']:+.1f}")
     log(f"Adapter rerank@{Rmax} tốt nhất: {best_rr['rerank'][Rmax]:.1f}  ({best_rr['name']})  "
         f"chênh dual_rerank {best_rr['rerank'][Rmax] - de['rerank'][Rmax]:+.1f}")
+    sr = get(sel)
+    log(f"Biến thể chọn theo validation: {sel}  reach={sr['reach_r5']:.1f} ({sr['reach_r5'] - de['reach_r5']:+.1f})"
+        f"  final={sr['final_r5']:.1f} ({sr['final_r5'] - de['final_r5']:+.1f})")
+    log("    rerank so với dual: " + "  ".join(
+        f"R{R}={sr['rerank'][str(R)]:.1f} ({sr['rerank'][str(R)] - de['rerank'][str(R)]:+.1f})" for R in Rs))
+
+    log("\nCHẨN ĐOÁN XẾP HẠNG, final R@5 khi chỉ đổi cách chấm điểm:")
+    log("  nn = toàn corpus, không PQ | exact = tập reachable, không PQ | "
+        "ip = ADC tích vô hướng | l2 = ADC L2 (chính là final)")
+    log(f"  {'nhánh':18s}    nn  exact     ip     l2")
+    for r in [de, orc] + ([floor] if floor else []) + ads:
+        log(f"  {r['name']:18s} {r['nn_overlap']:5.1f}  {r['final_exact']:5.1f}  "
+            f"{r['final_ip']:5.1f}  {r['final_r5']:5.1f}")
+    big = [R for R in Rs if R > a.kappa]
+    if big:
+        log(f"\nẢnh hưởng của kappa={a.kappa} lên rerank khi R > kappa "
+            f"(số trước: hợp top-kappa từng node, đúng giao thức; số sau: top-R toàn cục như gate 3 đầu):")
+        for r in [de] + ads:
+            log(f"  {r['name']:18s} " + "  ".join(
+                f"R{R}: {r['rerank'][str(R)]:5.1f} / {r['rerank_nokappa'][str(R)]:5.1f}" for R in big))
     log("\nTIÊU CHÍ GATE (chốt trước):")
     log("  ĐẠT  : adapter+rerank không thấp hơn dual_rerank quá 5 điểm ở cùng R, VÀ reach không thấp hơn dual quá 5 điểm")
     log("  TRƯỢT: reach adapter tốt nhất thấp hơn dual quá 15 điểm trên cả hai cặp mô hình")
