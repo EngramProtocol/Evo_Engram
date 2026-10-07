@@ -77,3 +77,6 @@ venv/
 result_*.json
 probeC_*.json
 *.log
+probeD_*.json
+bench_*.json
+__pycache__/
