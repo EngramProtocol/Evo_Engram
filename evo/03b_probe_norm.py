@@ -104,6 +104,7 @@ def retrieve_norm(qv_route, qv_rank, div_pq, anchors, P_list, codes, cb, nid, gt
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True)
+    ap.add_argument("--dataset", default="code", help="tiền tố file trong data/: code, scifact ...")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--seed", type=int, default=20235956)
     ap.add_argument("--nodes", type=int, default=10000)
@@ -122,13 +123,13 @@ def main():
     D = a.data_dir
     Rs = [int(x) for x in a.rerank.split(",")]
 
-    E0 = np.load(f"{D}/code_corpus_embeddings.npy").astype(np.float32)
-    Q0 = np.load(f"{D}/code_query_embeddings.npy").astype(np.float32)
-    cb0 = np.load(f"{D}/code_pq_codebook_m512.npy").astype(np.float32)
-    cd0 = np.load(f"{D}/code_pq_codes_m512.npy")
-    E1 = np.load(f"{D}/code_{a.tag}_corpus_embeddings.npy").astype(np.float32)
-    Q1 = np.load(f"{D}/code_{a.tag}_query_embeddings.npy").astype(np.float32)
-    gt1 = json.load(open(f"{D}/code_{a.tag}_ground_truth.json"))
+    E0 = np.load(f"{D}/{a.dataset}_corpus_embeddings.npy").astype(np.float32)
+    Q0 = np.load(f"{D}/{a.dataset}_query_embeddings.npy").astype(np.float32)
+    cb0 = np.load(f"{D}/{a.dataset}_pq_codebook_m512.npy").astype(np.float32)
+    cd0 = np.load(f"{D}/{a.dataset}_pq_codes_m512.npy")
+    E1 = np.load(f"{D}/{a.dataset}_{a.tag}_corpus_embeddings.npy").astype(np.float32)
+    Q1 = np.load(f"{D}/{a.dataset}_{a.tag}_query_embeddings.npy").astype(np.float32)
+    gt1 = json.load(open(f"{D}/{a.dataset}_{a.tag}_ground_truth.json"))
     N, d0 = E0.shape; d1 = E1.shape[1]; NQall = len(gt1)
     ev = np.arange(a.nq)
     trq = np.arange(a.nq, NQall)
@@ -136,14 +137,15 @@ def main():
     gt5_all = [np.array([int(r["index"]) for r in g["top_5_results"][:5]]) for g in gt1]
     gt5 = [gt5_all[i] for i in ev]
 
-    log("=" * 78)
-    log(f"tag={a.tag} seed={a.seed}  d0={d0} d1={d1}  N={N} nodes={a.nodes}  (gate 3d)")
-
     rnd = random.Random(a.seed)
     nid = np.array([rnd.getrandbits(63) for _ in range(a.nodes)], dtype=np.int64)
     P0 = pb.gen_proj(a.seed, d0, a.tables)
     perm = np.random.RandomState(a.seed).permutation(N)
     S = perm[:max(a.tables * 20, int(round(a.frac * N)))]
+
+    log("=" * 78)
+    log(f"dataset={a.dataset} tag={a.tag} seed={a.seed}  d0={d0} d1={d1}  N={N} nodes={a.nodes}  "
+        f"mẫu adapter={len(S)} ({a.frac:.1%})  (gate 3d)")
 
     anchors0 = pb.build_index(E0, P0, nid)
     load0 = np.bincount(anchors0.ravel(), minlength=a.nodes)
@@ -190,13 +192,13 @@ def main():
     show(rn)
 
     # ---------------- tự kiểm
-    exp = GATE2_NN.get((a.tag, a.seed))
+    exp = GATE2_NN.get((a.tag, a.seed)) if a.dataset == "code" else None
     if exp is not None and a.nq == 300 and abs(a.frac - 0.10) < 1e-9:
         ok = abs(rn["nn_overlap"] - exp) < 0.15
         log(f"\n  >>> nn của A_split_norm = {rn['nn_overlap']:.1f}, gate 2 derived_true_v0/ridge = {exp:.1f}"
             f"  ->  {'KHỚP' if ok else 'LỆCH, dừng lại kiểm tra'}")
     f3c = f"probeD_{a.tag}_s{a.seed}_g3c.json"
-    if os.path.exists(f3c):
+    if a.dataset == "code" and abs(a.frac - 0.10) < 1e-9 and os.path.exists(f3c):
         old = {r["name"]: r for r in json.load(open(f3c))["results"]}
         bad = 0
         for r in results[:3]:
@@ -252,7 +254,8 @@ def main():
     log("\nTIÊU CHÍ GATE (chốt trước): ĐẠT nếu adapter+rerank không thấp hơn dual_rerank quá 5 điểm ở cùng R"
         " và reach không thấp hơn dual quá 5 điểm; VƯỢT DUAL nếu final > dual_encode")
 
-    out = a.out or f"probeE_{a.tag}_s{a.seed}.json"
+    out = a.out or (f"probeE_{a.tag}_s{a.seed}.json" if a.dataset == "code"
+                    else f"probeE_{a.dataset}_{a.tag}_s{a.seed}.json")
     json.dump(dict(argv=vars(a), d0=d0, d1=d1, n_sample_doc=int(len(S)), diag=diag,
                    results=results), open(out, "w"), indent=1)
     log(f"\n-> {out}   ({time.time() - t0:.0f}s)")

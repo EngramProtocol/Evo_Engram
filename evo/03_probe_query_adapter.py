@@ -189,6 +189,7 @@ def nn_overlap(qv, E, gt5, k=5):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True)
+    ap.add_argument("--dataset", default="code", help="tiền tố file trong data/: code, scifact ...")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--seed", type=int, default=20235956)
     ap.add_argument("--nodes", type=int, default=10000)
@@ -208,13 +209,13 @@ def main():
     D = a.data_dir
     Rs = [int(x) for x in a.rerank.split(",")]
 
-    E0 = np.load(f"{D}/code_corpus_embeddings.npy").astype(np.float32)
-    Q0 = np.load(f"{D}/code_query_embeddings.npy").astype(np.float32)
-    cb0 = np.load(f"{D}/code_pq_codebook_m512.npy").astype(np.float32)
-    cd0 = np.load(f"{D}/code_pq_codes_m512.npy")
-    E1 = np.load(f"{D}/code_{a.tag}_corpus_embeddings.npy").astype(np.float32)
-    Q1 = np.load(f"{D}/code_{a.tag}_query_embeddings.npy").astype(np.float32)
-    gt1 = json.load(open(f"{D}/code_{a.tag}_ground_truth.json"))
+    E0 = np.load(f"{D}/{a.dataset}_corpus_embeddings.npy").astype(np.float32)
+    Q0 = np.load(f"{D}/{a.dataset}_query_embeddings.npy").astype(np.float32)
+    cb0 = np.load(f"{D}/{a.dataset}_pq_codebook_m512.npy").astype(np.float32)
+    cd0 = np.load(f"{D}/{a.dataset}_pq_codes_m512.npy")
+    E1 = np.load(f"{D}/{a.dataset}_{a.tag}_corpus_embeddings.npy").astype(np.float32)
+    Q1 = np.load(f"{D}/{a.dataset}_{a.tag}_query_embeddings.npy").astype(np.float32)
+    gt1 = json.load(open(f"{D}/{a.dataset}_{a.tag}_ground_truth.json"))
     N, d0 = E0.shape; d1 = E1.shape[1]; NQall = len(gt1)
     assert E1.shape[0] == N and Q1.shape[0] == Q0.shape[0] == NQall
     m1 = d1 // a.dsub
@@ -225,7 +226,7 @@ def main():
     gt5 = [gt5_all[i] for i in ev]
 
     log("=" * 78)
-    log(f"tag={a.tag} seed={a.seed}  d0={d0} d1={d1}  N={N} nodes={a.nodes}")
+    log(f"dataset={a.dataset} tag={a.tag} seed={a.seed}  d0={d0} d1={d1}  N={N} nodes={a.nodes}")
     log(f"đánh giá {len(ev)} query | huấn luyện adapter phía query {len(trq)} query "
         f"(tách rời) | document mẫu f={a.frac:.0%}")
 
@@ -278,7 +279,7 @@ def main():
     log(f"  {'oracle_full':18s} reach={ro['reach_r5']:5.1f} final={ro['final_r5']:5.1f} | "
         f"nodes={ro['nodes']:.0f} cand={ro['cand']:.0f} moved={ro['moved']:.0f}")
 
-    exp = EXPECTED.get((a.tag, a.seed))
+    exp = EXPECTED.get((a.tag, a.seed)) if a.dataset == "code" else None
     if exp and a.nq == 300 and a.nodes == 10000:
         de = next(r for r in results if r["name"] == "dual_encode")
         ok = (abs(de["reach_r5"] - exp["dual_encode"][0]) < 0.15 and
@@ -428,7 +429,8 @@ def main():
     log("  TRƯỢT: reach adapter tốt nhất thấp hơn dual quá 15 điểm trên cả hai cặp mô hình")
     log("  VƯỢT DUAL: adapter có final > dual_encode -> query M1 qua adapter dùng chỉ mục cũ tốt hơn cả chính M0")
 
-    out = a.out or f"probeD_{a.tag}_s{a.seed}.json"
+    out = a.out or (f"probeD_{a.tag}_s{a.seed}.json" if a.dataset == "code"
+                    else f"probeD_{a.dataset}_{a.tag}_s{a.seed}.json")
     json.dump(dict(argv=vars(a), d0=d0, d1=d1, n_train_query=int(len(trq)),
                    n_sample_doc=int(len(S)), diag=diag, results=results),
               open(out, "w"), indent=1)

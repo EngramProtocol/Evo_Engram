@@ -5,14 +5,16 @@ xếp hạng (nn / exact / ip / l2). Không dùng scipy."""
 import json, glob, sys
 import numpy as np
 
-pat = sys.argv[1] if len(sys.argv) > 1 else "probeD_*_Rfine.json"
+pats = sys.argv[1:] or ["probeD_*_Rfine.json"]
 runs = {}
-for f in sorted(glob.glob(pat)):
+for f in sorted({x for p in pats for x in glob.glob(p)}):
     d = json.load(open(f))
-    runs.setdefault(d["argv"]["tag"], []).append(
-        (d["argv"]["seed"], {r["name"]: r for r in d["results"]}, d.get("diag", {})))
+    av = d["argv"]
+    key = (av.get("dataset", "code"), av["tag"], round(float(av.get("frac", 0.10)), 4))
+    runs.setdefault(key, []).append(
+        (av["seed"], {r["name"]: r for r in d["results"]}, d.get("diag", {})))
 if not runs:
-    sys.exit(f"không thấy file nào khớp {pat}")
+    sys.exit(f"không thấy file nào khớp {pats}")
 
 
 def r_needed(Rs, curve, target):
@@ -63,11 +65,11 @@ def diff_lines(rr, arm_of, Rs, label):
     print(mult_line(rr, arm_of, Rs))
 
 
-for tag, rr in runs.items():
+for (dset, tag, frac), rr in sorted(runs.items()):
     seeds = [s for s, _, _ in rr]
     Rs = sorted({int(k) for _, R, _ in rr for k in R["dual_encode"]["rerank"]})
     print("=" * 84)
-    print(f"{tag}   seed = {seeds}   (chênh = adapter - dual, ghép cặp theo seed, mean ± sd)")
+    print(f"{dset} / {tag} / mẫu adapter {frac:.1%}   seed = {seeds}   (chênh = adapter - dual, ghép cặp theo seed, mean ± sd)")
     mean = lambda arm, key: np.mean([R[arm][key] for _, R, _ in rr])
     print(f"  dual   reach {mean('dual_encode', 'reach_r5'):5.1f}  final {mean('dual_encode', 'final_r5'):5.1f}  rerank "
           + "  ".join(f"R{r}={np.mean([R['dual_encode']['rerank'][str(r)] for _, R, _ in rr]):5.1f}" for r in Rs))
