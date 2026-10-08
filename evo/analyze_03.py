@@ -92,5 +92,6 @@ for tag, rr in runs.items():
         print("\n  CHẨN ĐOÁN (mean qua seed): nn = toàn corpus không PQ | exact = reachable không PQ"
               " | ip = ADC tích vô hướng | l2 = final")
         print(f"  {'nhánh':18s}    nn  exact     ip     l2")
-        for arm in ["dual_encode", "oracle_full"] + (["no_adapter"] if "no_adapter" in rr[0][1] else []) + arms:
+        extra = [n for n in ("oracle_full", "no_adapter") if n in rr[0][1]]
+        for arm in ["dual_encode"] + extra + arms:
             print(f"  {arm:18s} " + "  ".join(f"{mean(arm, k):5.1f}" for k in keys))
