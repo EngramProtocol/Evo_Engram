@@ -51,11 +51,14 @@ K_PARA = 5
 LLM_DEFAULT = "Qwen/Qwen2.5-3B-Instruct"
 
 PROMPTS = {
-    "code": ("The following one-sentence description of a Python function is used as a search query in a code "
-             "search engine:\n\n\"{q}\"\n\nWrite 5 different ways a developer could phrase a search for the same "
-             "function. Keep the meaning and the level of detail; change the wording and the sentence structure. "
-             "Do not add details that are not in the original and do not write code. Output exactly 5 lines, one "
-             "query per line, without numbering or quotation marks."),
+    "code": ("The following sentence is the first line of a Python function's docstring. It is used as a search "
+             "query to find that function in a code search engine:\n\n\"{q}\"\n\nRewrite it in 5 different ways a "
+             "developer could type to find the same function. Every rewrite must describe the same operation with the "
+             "same specific details (names, objects, quantities, conditions) as the original, so that it identifies "
+             "the same function. Change the wording and the sentence structure. Write each rewrite as a statement, "
+             "not a question: do not ask how to use the function or what it does, do not mention Python, and do not "
+             "add details that are not in the original. Do not write code. Output exactly 5 lines, one rewrite per "
+             "line, without numbering or quotation marks."),
     "scifact": ("The following scientific claim is used as a search query to find research abstracts that support "
                 "or refute it:\n\n\"{q}\"\n\nWrite 5 paraphrases of this claim that keep the same scientific "
                 "meaning (same entities, same direction of effect, same conditions) but use different wording and "
@@ -335,14 +338,23 @@ def norm_txt(s):
     return re.sub(r'[^a-z0-9 ]+', '', re.sub(r'\s+', ' ', s.lower())).strip()
 
 
-def parse_para(raw, orig):
+_QUESTION = re.compile(r"^(what|how|can|could|where|which|why|is there|are there|does|do|should|would)\b", re.I)
+PROMPT_VERSION = {"code": "v2", "scifact": "v1"}
+
+
+def parse_para(raw, orig, ds=None):
     """Quy tắc lọc cố định: bỏ đánh số và ngoặc kép; bỏ dòng rỗng, trùng câu gốc, trùng nhau, dưới 3 từ,
-    hoặc dài hơn 3 lần câu gốc cộng 10 từ."""
+    hoặc dài hơn 3 lần câu gốc cộng 10 từ. Riêng code (v2): bỏ dòng dạng câu hỏi (kết thúc bằng '?' hoặc mở
+    đầu bằng what/how/can/...) và dòng nhắc 'python' khi câu gốc không có, vì các dòng này hỏi về hàm thay vì
+    mô tả đúng thao tác của hàm."""
     out, seen = [], {norm_txt(orig)}
     lim = 3 * len(orig.split()) + 10
     for ln in raw.split("\n"):
-        s = _STRIP.sub("", ln).strip().strip('"“”\'').strip()
+        s = _STRIP.sub("", ln).strip().strip('"\u201c\u201d\'').strip()
         if not s or len(s.split()) < 3 or len(s.split()) > lim:
+            continue
+        if ds == "code" and (s.endswith("?") or _QUESTION.match(s)
+                             or ("python" in s.lower() and "python" not in orig.lower())):
             continue
         k = norm_txt(s)
         if not k or k in seen:
@@ -413,11 +425,11 @@ def step_para(a, out):
             batch = qs[s:s + a.llm_batch]
             outs = llm.generate([PROMPTS[ds].format(q=q) for q in batch])
             for j, (q, r) in enumerate(zip(batch, outs)):
-                ps = parse_para(r, q)
+                ps = parse_para(r, q, ds)
                 extra = ""
                 if len(ps) < K_PARA:       # thiếu thì sinh thêm một lần, lấy mẫu có seed cố định
                     extra = llm.generate([PROMPTS[ds].format(q=q)], sample=True, seed=1000 + s + j)[0]
-                    for p in parse_para(extra, q):
+                    for p in parse_para(extra, q, ds):
                         if norm_txt(p) not in {norm_txt(x) for x in ps}:
                             ps.append(p)
                 raws.append({"query": q, "raw": r, "raw_extra": extra})
@@ -428,7 +440,8 @@ def step_para(a, out):
         log(f"[para] {ds}: trung bình {np.mean(nk):.2f} paraphrase/query, đủ 5: {sum(k == K_PARA for k in nk)}/{len(nk)}",
             out)
         log(f"[para] mẫu: {qs[0]!r} -> {paras[0][:2]}", out)
-        json.dump(dict(llm=a.llm if not a.fake else "fake", k=K_PARA, prompt=PROMPTS[ds], queries=qs,
+        json.dump(dict(llm=a.llm if not a.fake else "fake", k=K_PARA, prompt=PROMPTS[ds],
+                       prompt_version=PROMPT_VERSION[ds], queries=qs,
                        paraphrases=paras), open(os.path.join(od, f"{ds}_paraphrases.json"), "w"),
                   ensure_ascii=False, indent=1)
         json.dump(raws, open(os.path.join(od, f"{ds}_paraphrases_raw.json"), "w"), ensure_ascii=False, indent=1)
