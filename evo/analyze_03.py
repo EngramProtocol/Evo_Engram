@@ -88,6 +88,22 @@ for (dset, tag, frac), rr in sorted(runs.items()):
                   f"{a}={np.mean([dg['val']['arms'][a]['rerank'] for _, _, dg in rr]):5.1f}"
                   for a in rr[0][2]["val"]["arms"]))
 
+    # MLP (03c) và holdout
+    mi = [dg.get("mlp") for _, _, dg in rr]
+    if all(mi):
+        if all("lr" in m for m in mi):
+            print(f"\n  MLP: lr chọn {[m['lr'] for m in mi]}; lưới (góc validation theo lr, trung bình seed): " + "  ".join(
+                f"{k}:{np.mean([m['grid'][k]['val_angle'] for m in mi]):.2f}°/ep{np.mean([m['grid'][k]['best_epoch'] for m in mi]):.0f}"
+                for k in mi[0]["grid"]))
+        print(f"\n  MLP: epoch tốt nhất {[m['best_epoch'] for m in mi]}; góc validation ridge "
+              f"{np.mean([m['ridge_val_angle'] for m in mi]):.2f}° -> MLP {np.mean([m['val_angle'] for m in mi]):.2f}°;"
+              f" góc trên S ridge {np.mean([m['train_angle_ridge'] for m in mi]):.2f}° -> MLP "
+              f"{np.mean([m['train_angle_mlp'] for m in mi]):.2f}°")
+    ni = [dg.get("n_index") for _, _, dg in rr]
+    if all(ni):
+        print(f"  chỉ mục E0 khi đánh giá: {ni[0]} record; ground truth tính lại trùng file "
+              f"{100 * np.mean([dg.get('gt_agree', np.nan) for _, _, dg in rr]):.1f}%")
+
     # chẩn đoán xếp hạng
     keys = ("nn_overlap", "final_exact", "final_ip", "final_r5")
     if all(k in rr[0][1]["dual_encode"] for k in keys):

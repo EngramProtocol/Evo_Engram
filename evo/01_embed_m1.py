@@ -31,6 +31,7 @@ DEFAULT_PREFIX = {
     "bge": ("", ""),                      # (query, passage)
     "e5": ("query: ", "passage: "),
     "gte": ("", ""),
+    "snowflake": ("Represent this sentence for searching relevant passages: ", ""),
 }
 
 
