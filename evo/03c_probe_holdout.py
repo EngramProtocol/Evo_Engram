@@ -18,6 +18,10 @@ Nhánh: dual_encode, A_doc_ridge, A_split_norm, A_mlp, A_mlp_split_norm; chọn 
 Tự kiểm: --holdout 0 với frac 0.10: dual_encode, A_doc_ridge, A_split_norm phải khớp đúng từng số của
 probeE (gate 3d) cùng seed. Ground truth tính lại trên toàn corpus phải trùng file ground truth.
 
+Đợt 5: --pair-src pq học Wr, Wf (và MLP nếu bật) trên cặp (E1[S], c_S), với c_S là bản tái tạo PQ của
+record E0 thay cho embedding M0 đầy đủ. Chỉ mục E0, dual và mọi phép chấm điểm giữ nguyên; mặc định exact
+giữ đúng từng số của đợt 4. Tự kiểm: dual_encode phải trùng file exact cùng seed và cùng frac.
+
 CHẠY: python3 evo/03c_probe_holdout.py --tag bgebase --seed 20235956 --frac 0.10 --holdout 1
 """
 import argparse, importlib.util, json, os, random, time
@@ -165,6 +169,8 @@ def main():
     ap.add_argument("--mlp-batch", type=int, default=128)
     ap.add_argument("--mlp-patience", type=int, default=15)
     ap.add_argument("--rerank", default="5,10,15,20,30,50,100")
+    ap.add_argument("--pair-src", default="exact", choices=["exact", "pq"],
+                    help="vế M0 của cặp học adapter: exact = embedding M0 đầy đủ (đợt 4), pq = bản tái tạo PQ của record E0")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     t0 = time.time()
@@ -189,7 +195,7 @@ def main():
     S = perm[:max(a.tables * 20, int(round(a.frac * N)))]
     log("=" * 78)
     log(f"[03c] dataset={ds} tag={a.tag} seed={a.seed}  N={N}  mẫu S={len(S)} ({a.frac:.1%})  "
-        f"holdout={a.holdout}  mlp={a.mlp}")
+        f"holdout={a.holdout}  mlp={a.mlp}  cặp học: {a.pair_src}")
 
     # ground truth tính lại trên toàn corpus phải trùng file
     def top5(Qm, Em):
@@ -204,14 +210,20 @@ def main():
     log(f"ground truth tính lại trên toàn corpus trùng file: {100 * agree:.1f}% query"
         + ("" if agree >= 0.99 else "   <-- THẤP, kiểm tra lại định nghĩa ground truth"))
 
-    # ánh xạ học trên S (y hệt 03b)
-    Wr, lam_dr, _ = q3.fit_ridge_cv(E1[S], E0[S], a.seed, LAMS)
-    Wf, lam_f = pb.fit_bridge(E0[S], E1[S], "ridge", a.seed)
+    # ánh xạ học trên S (y hệt 03b); đợt 5: vế M0 có thể là bản tái tạo PQ
+    if a.pair_src == "exact":
+        X0S = E0[S]
+    else:
+        X0S = cb0[np.arange(cb0.shape[0])[None, :], cd0[S]].reshape(len(S), d0).astype(np.float32)
+    pcos = (E0[S] * X0S).sum(1) / np.linalg.norm(E0[S], axis=1) / np.linalg.norm(X0S, axis=1)
+    pair_info = dict(src=a.pair_src, cos_mean_S=float(pcos.mean()), cos_min_S=float(pcos.min()))
+    Wr, lam_dr, _ = q3.fit_ridge_cv(E1[S], X0S, a.seed, LAMS)
+    Wf, lam_f = pb.fit_bridge(X0S, E1[S], "ridge", a.seed)
     WfT = np.ascontiguousarray(Wf.T)
     mlp_info = None
     if a.mlp:
         tm = time.time()
-        Pm, mlp_info = fit_mlp_adapter(E1[S], E0[S], Wr, a)
+        Pm, mlp_info = fit_mlp_adapter(E1[S], X0S, Wr, a)
         log("MLP lưới lr: " + "  ".join(f"lr={k}: epoch {v['best_epoch']}/{v['epochs_run']} góc {v['val_angle']:.2f}°"
                                         for k, v in mlp_info["grid"].items()))
         log(f"MLP: lr chọn {mlp_info['lr']:g}, epoch tốt nhất {mlp_info['best_epoch']} (chạy {mlp_info['epochs_run']}); góc validation "
@@ -269,7 +281,7 @@ def main():
     checks = {}
     pre = "" if ds == "code" else f"{ds}_"
     f3d = f"probeE_{pre}{a.tag}_s{a.seed}.json"
-    if not a.holdout and os.path.exists(f3d) and abs(json.load(open(f3d))["argv"]["frac"] - a.frac) < 1e-9:
+    if a.pair_src == "exact" and not a.holdout and os.path.exists(f3d) and abs(json.load(open(f3d))["argv"]["frac"] - a.frac) < 1e-9:
         old = {r["name"]: r for r in json.load(open(f3d))["results"]}
         bad, n = 0, 0
         for r in results:
@@ -312,8 +324,23 @@ def main():
         log(f"  {r['name']:18s} {r['final_r5'] - de['final_r5']:+5.1f} | " + " ".join(
             f"{r['rerank'][str(R)] - de['rerank'][str(R)]:+5.1f}" for R in (10, 20, 50) if str(R) in r["rerank"]))
 
-    out = a.out or f"probeH_{pre}{a.tag}_s{a.seed}_f{a.frac:g}_ho{a.holdout}.json"
-    json.dump(dict(argv=vars(a), d0=d0, d1=d1, n_sample_doc=int(len(S)), diag=diag, checks=checks,
+    sfx = "" if a.pair_src == "exact" else "_pq"
+    fex = f"probeH_{pre}{a.tag}_s{a.seed}_f{a.frac:g}_ho{a.holdout}.json"
+    if a.pair_src != "exact" and os.path.exists(fex):
+        ex = json.load(open(fex))
+        o = {r["name"]: r for r in ex["results"]}.get("dual_encode")
+        r = results[0]
+        if o is not None and ex["argv"]["nodes"] == a.nodes and ex["argv"]["nq"] == a.nq:
+            n, bad = 0, 0
+            for k in ("reach_r5", "final_r5", "nodes", "cand", "moved"):
+                n += 1; bad += abs(o[k] - r[k]) > 1e-9
+            for R in r["rerank"]:
+                if R in o["rerank"]:
+                    n += 1; bad += abs(o["rerank"][R] - r["rerank"][R]) > 1e-9
+            checks["dual_vs_exact"] = dict(file=fex, n=n, bad=int(bad))
+            log(f"  >>> dual_encode so với bản exact ({fex}): {n} giá trị, {'KHỚP' if bad == 0 else f'{bad} LỆCH'}")
+    out = a.out or f"probeH_{pre}{a.tag}_s{a.seed}_f{a.frac:g}_ho{a.holdout}{sfx}.json"
+    json.dump(dict(argv=vars(a), d0=d0, d1=d1, n_sample_doc=int(len(S)), pair=pair_info, diag=diag, checks=checks,
                    results=results), open(out, "w"), indent=1)
     log(f"\n-> {out}   ({time.time() - t0:.0f}s)")
 

@@ -40,6 +40,10 @@ Bổ sung đợt 4 (mặc định giữ nguyên hành vi đợt 3b, tự kiểm 
                             paraphrase của query đó (không dùng câu gốc). Ground truth của mỗi lượt là top-5 M1
                             của chính câu paraphrase. Query giữ riêng vẫn là câu gốc.
 
+Bổ sung đợt 5: --pair-src pq học adapter (Wr, Wf, hiệu chỉnh cross-fit) trên bản tái tạo PQ của record E0
+thay cho embedding M0 đầy đủ; file ra thêm hậu tố _pq và tự kiểm t = 0 với probeG_..._pq.json của 04b.
+Mặc định exact giữ đúng từng số của đợt 4.
+
 CHẠY: python3 evo/06_probe_lazy.py --tag bgebase --seed 20235956
 """
 import argparse, collections, importlib.util, json, os, random, time
@@ -93,6 +97,8 @@ def main():
     ap.add_argument("--check-3b", default="auto", help="file probeL đợt 3b để tự kiểm; auto = tên mặc định; none = bỏ")
     ap.add_argument("--trace-runs", default="", help="khoá run cần ghi vết từng truy vấn cho 08_sim_evo, vd z1|PROB|lazy")
     ap.add_argument("--trace-out", default=None)
+    ap.add_argument("--pair-src", default="exact", choices=["exact", "pq"],
+                    help="vế M0 của cặp học adapter: exact = embedding M0 đầy đủ (đợt 4), pq = bản tái tạo PQ của record E0")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     t0 = time.time()
@@ -127,11 +133,12 @@ def main():
         f"zipf={zipfs}  R={a.R}  gộp={fusions}  chính sách={policies}")
 
     # ---------------- adapter, PQ E1, chỉ mục (giống 04b)
-    Wr, _, _ = q3.fit_ridge_cv(E1[S], E0[S], a.seed, (1e-3, 1e-2, 1e-1, 1.0, 10.0))
-    Wf, _ = pb.fit_bridge(E0[S], E1[S], "ridge", a.seed)
-    WfT = np.ascontiguousarray(Wf.T)
     m0 = cb0.shape[0]
     C0 = cb0[np.arange(m0)[None, :], cd0].reshape(N, d0).astype(np.float32)
+    X0 = E0 if a.pair_src == "exact" else C0          # vế M0 của cặp học (đợt 5)
+    Wr, _, _ = q3.fit_ridge_cv(E1[S], X0[S], a.seed, (1e-3, 1e-2, 1e-1, 1.0, 10.0))
+    Wf, _ = pb.fit_bridge(X0[S], E1[S], "ridge", a.seed)
+    WfT = np.ascontiguousarray(Wf.T)
     n_i = np.linalg.norm(C0 @ Wf, axis=1)
     cb1 = pb.pq_train(E1[S], m1, a.seed)
     cd1 = pb.pq_encode(E1, cb1)
@@ -140,7 +147,7 @@ def main():
     mu_q = Q1[trq].mean(0).astype(np.float32)
     anchorsK = (pb.build_index(E1, P1, nid) if a.e1_key == "u" else pb.build_index(E1 - mu_d, P1, nid))
 
-    Xcf, _ = mc.crossfit_adapter_x(E0, E1, C0, cb0, cd0, Q1[trq], S, S, a.folds, a.seed)
+    Xcf, _ = mc.crossfit_adapter_x(X0, E1, C0, cb0, cd0, Q1[trq], S, S, a.folds, a.seed)
     Ycf = mc.e1_scores(Q1[trq], cb1, cd1, S)
     ols_ad = mc.ols_top(list(Xcf), list(Ycf), a.cal_top)
     sig1 = mc.sigma_e1(Q1[trq], E1, cb1, cd1, S, a.cal_top)
@@ -201,7 +208,8 @@ def main():
     res0, _ = m4b.evaluate(arms_chk, {"A": sides_A, sideK: sides_K}, [gt5_all[i] for i in ev], Q1[ev], st0,
                            {"AD": cal}, a.kappa, Rs_chk, E1)
     pre = "" if ds == "code" else f"{ds}_"
-    fG = f"probeG_{pre}{a.tag}_s{a.seed}.json"
+    sfx = "" if a.pair_src == "exact" else "_pq"
+    fG = f"probeG_{pre}{a.tag}_s{a.seed}{sfx}.json"
     check = None
     if os.path.exists(fG):
         G = json.load(open(fG))
@@ -413,7 +421,7 @@ def main():
         c, d = sp.split(":")
         specs.append((None if c == "inf" else float(c), int(d), sp))
 
-    out = dict(argv=vars(a), n_sample=int(nS), N=int(N), e1_key=key, e1_key_val=sc, cal=ols_ad, sig1=sig1,
+    out = dict(argv=vars(a), n_sample=int(nS), N=int(N), pair_src=a.pair_src, e1_key=key, e1_key_val=sc, cal=ols_ad, sig1=sig1,
                check_04b=check, t0=res0, para_info=para_info, runs={})
     trace_keys = set(x for x in a.trace_runs.split(",") if x)
     traces = {}
@@ -472,7 +480,7 @@ def main():
     f3b = None if a.check_3b == "none" else (a.check_3b if a.check_3b != "auto" else
                                              (f"probeL_{pre}{a.tag}_s{a.seed}_ku.json" if key == "u" else
                                               f"probeL_{pre}{a.tag}_s{a.seed}.json"))
-    fn = a.out or (f"probeL_{pre}{a.tag}_s{a.seed}.json" if key != "u" else f"probeL_{pre}{a.tag}_s{a.seed}_ku.json")
+    fn = a.out or (f"probeL_{pre}{a.tag}_s{a.seed}{sfx}.json" if key != "u" else f"probeL_{pre}{a.tag}_s{a.seed}_ku{sfx}.json")
     out["check_3b"] = None
     if f3b and os.path.exists(f3b) and os.path.abspath(f3b) != os.path.abspath(fn):
         old = json.load(open(f3b))

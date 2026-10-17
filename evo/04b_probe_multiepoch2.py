@@ -31,6 +31,12 @@ Tự kiểm:
   (2) AD_RRF, AD_CAL, DU_RRF, DU_CAL, E1ONLY khớp đúng từng số của probe 04 (probeF_...json) ở mọi f
   (3) ADR_* ở f = |S|/N trùng AD_*, vì khi đó M = S (đi lại toàn bộ đường học lại)
 
+Đợt 5 (sau góp ý của thầy): --pair-src pq học Wr, Wf và hiệu chỉnh cross-fit trên bản tái tạo PQ c_o của
+record E0 thay cho embedding M0 đầy đủ, cả trên S lẫn khi học lại trên M. Re-indexer đọc được c_o từ chính
+record E0 (PQ code + codebook công khai) trước khi xoá, nên không cần lưu M0 hay chạy lại M0. Chỉ mục E0 vẫn
+dựng từ embedding M0 thật (record cũ đã được đặt như vậy từ trước). Mặc định exact giữ đúng từng số của đợt 4.
+Tự kiểm của chế độ pq: mọi nhánh không dùng adapter (DU_*, E1ONLY*) phải trùng file exact cùng seed.
+
 CHẠY: python3 evo/04b_probe_multiepoch2.py --tag bgebase --seed 20235956
 """
 import argparse, json, os, random, time
@@ -174,6 +180,8 @@ def main():
     ap.add_argument("--cal-top", type=int, default=30)
     ap.add_argument("--folds", type=int, default=5, help="số fold cross-fit khi hiệu chỉnh adapter")
     ap.add_argument("--cal-cap", type=int, default=2000, help="tối đa số document hiệu chỉnh khi học lại")
+    ap.add_argument("--pair-src", default="exact", choices=["exact", "pq"],
+                    help="vế M0 của cặp học adapter: exact = embedding M0 đầy đủ (đợt 4), pq = bản tái tạo PQ của record E0")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     t0 = time.time()
@@ -205,14 +213,22 @@ def main():
     S = perm[:nS]
     mig_order = perm
     log("=" * 78)
-    log(f"[04b] dataset={ds} tag={a.tag} seed={a.seed}  N={N} nodes={a.nodes}  mẫu S={nS} ({nS / N:.1%})  f={fgrid}")
+    log(f"[04b] dataset={ds} tag={a.tag} seed={a.seed}  N={N} nodes={a.nodes}  mẫu S={nS} ({nS / N:.1%})  f={fgrid}"
+        f"  cặp học: {a.pair_src}")
 
     # ---------------- adapter như gate 3d và 04
-    Wr, _, _ = q3.fit_ridge_cv(E1[S], E0[S], a.seed, (1e-3, 1e-2, 1e-1, 1.0, 10.0))
-    Wf, _ = pb.fit_bridge(E0[S], E1[S], "ridge", a.seed)
-    WfT = np.ascontiguousarray(Wf.T)
     m0 = cb0.shape[0]
     C0 = cb0[np.arange(m0)[None, :], cd0].reshape(N, d0).astype(np.float32)
+    X0 = E0 if a.pair_src == "exact" else C0          # vế M0 của mọi cặp học (S, M, cross-fit)
+    pcos = (E0 * C0).sum(1) / np.linalg.norm(E0, axis=1) / np.linalg.norm(C0, axis=1)
+    prel = np.linalg.norm(E0 - C0, axis=1) / np.linalg.norm(E0, axis=1)
+    pair_info = dict(src=a.pair_src, cos_mean=float(pcos.mean()), cos_min=float(pcos.min()),
+                     rel_err_mean=float(prel.mean()), rel_err_p99=float(np.percentile(prel, 99)))
+    log(f"PQ so với M0 đầy đủ: cos TB={pair_info['cos_mean']:.5f} nhỏ nhất={pair_info['cos_min']:.5f}  "
+        f"sai số tương đối TB={pair_info['rel_err_mean']:.4f} p99={pair_info['rel_err_p99']:.4f}")
+    Wr, _, _ = q3.fit_ridge_cv(E1[S], X0[S], a.seed, (1e-3, 1e-2, 1e-1, 1.0, 10.0))
+    Wf, _ = pb.fit_bridge(X0[S], E1[S], "ridge", a.seed)
+    WfT = np.ascontiguousarray(Wf.T)
     n_i = np.linalg.norm(C0 @ Wf, axis=1)
 
     cb1 = pb.pq_train(E1[S], m1, a.seed)
@@ -242,7 +258,7 @@ def main():
     ca, cb_, cr = mc.fit_cal_04(xa, y, a.cal_top)
     da, db, dr = mc.fit_cal_04(xd, y, a.cal_top)
     # (b) cross-fit cho adapter: mỗi document trong S chấm bằng Wf học trên S trừ fold của nó
-    Xcf, lam_cf = mc.crossfit_adapter_x(E0, E1, C0, cb0, cd0, Q1[trq], S, S, a.folds, a.seed)
+    Xcf, lam_cf = mc.crossfit_adapter_x(X0, E1, C0, cb0, cd0, Q1[trq], S, S, a.folds, a.seed)
     Ycf = mc.e1_scores(Q1[trq], cb1, cd1, S)
     ols_ad = mc.ols_top(list(Xcf), list(Ycf), a.cal_top)
     ols_ad_in = mc.ols_top(xa, y, a.cal_top)
@@ -337,11 +353,11 @@ def main():
         sides["AR"] = sides_e["A"]
         if 0 < nM < N:
             M = mig_order[:nM]
-            WrF, lamr, _ = q3.fit_ridge_cv(E1[M], E0[M], a.seed, mc.LAMS)
-            WfF, lamf = pb.fit_bridge(E0[M], E1[M], "ridge", a.seed)
+            WrF, lamr, _ = q3.fit_ridge_cv(E1[M], X0[M], a.seed, mc.LAMS)
+            WfF, lamf = pb.fit_bridge(X0[M], E1[M], "ridge", a.seed)
             n_iF = np.linalg.norm(C0 @ WfF, axis=1)
             Cf = M[:max(a.cal_cap, nS)]
-            Xf, lamk = mc.crossfit_adapter_x(E0, E1, C0, cb0, cd0, Q1[trq], M, Cf, a.folds, a.seed)
+            Xf, lamk = mc.crossfit_adapter_x(X0, E1, C0, cb0, cd0, Q1[trq], M, Cf, a.folds, a.seed)
             Yf = mc.e1_scores(Q1[trq], cb1, cd1, Cf)
             ols_f = mc.ols_top(list(Xf), list(Yf), a.cal_top)
             cals_f["ADR"] = dict(cal_a=None, cal_b=None, ols=ols_f, sig1=sig1)
@@ -385,8 +401,9 @@ def main():
     # ---------------- tự kiểm
     checks = {}
     pre = "" if ds == "code" else f"{ds}_"
+    sfx = "" if a.pair_src == "exact" else "_pq"
     f3d = f"probeE_{pre}{a.tag}_s{a.seed}.json"
-    if "0" in results and os.path.exists(f3d) and abs(a.frac - json.load(open(f3d))["argv"]["frac"]) < 1e-9:
+    if a.pair_src == "exact" and "0" in results and os.path.exists(f3d) and abs(a.frac - json.load(open(f3d))["argv"]["frac"]) < 1e-9:
         old = {r["name"]: r for r in json.load(open(f3d))["results"]}
         bad, n = 0, 0
         for mth, ref in (("AD_RRF", "A_split_norm"), ("AD_CAL", "A_split_norm"), ("AD_PROB", "A_split_norm"),
@@ -400,7 +417,7 @@ def main():
         checks["gate3d_f0"] = dict(n=n, bad=int(bad))
         log(f"\n>>> f = 0 so với gate 3d ({f3d}): {n} giá trị, {'KHỚP' if bad == 0 else f'{bad} LỆCH'}")
     f04 = f"probeF_{pre}{a.tag}_s{a.seed}.json"
-    if os.path.exists(f04) and abs(a.frac - json.load(open(f04))["argv"].get("frac", 0.10)) < 1e-9:
+    if a.pair_src == "exact" and os.path.exists(f04) and abs(a.frac - json.load(open(f04))["argv"].get("frac", 0.10)) < 1e-9:
         o4 = json.load(open(f04))["results"]
         bad, n = 0, 0
         for fk2, rr in results.items():
@@ -427,8 +444,28 @@ def main():
         checks["refit_at_S"] = dict(n=n, bad=int(bad))
         log(f">>> ADR so với AD ở f = {nS / N:.1%} (M = S): {n} giá trị, {'KHỚP' if bad == 0 else f'{bad} LỆCH'}")
 
-    out = a.out or f"probeG_{pre}{a.tag}_s{a.seed}.json"
-    json.dump(dict(argv=vars(a), n_sample=int(nS), N=int(N), Kstar=("c" if Kstar == "C" else "cq"),
+    fex = f"probeG_{pre}{a.tag}_s{a.seed}.json"
+    if a.pair_src != "exact" and os.path.exists(fex):
+        G = json.load(open(fex))
+        if (abs(G["argv"]["frac"] - a.frac) < 1e-9 and G["argv"]["nodes"] == a.nodes
+                and G["argv"].get("fmig") == a.fmig and G["argv"]["nq"] == a.nq):
+            bad, n = 0, 0
+            for fk2, rr in results.items():
+                for m in ARMS_EVAL:
+                    if SPEC[m][0] not in (None, "D") or fk2 not in G["results"]:
+                        continue
+                    new, o = rr[m], G["results"][fk2][m]
+                    for kk in ("reach_r5", "final_r5", "nodes", "cand", "moved", "e0_share_top5"):
+                        n += 1; bad += abs(new[kk] - o[kk]) > 1e-9
+                    for R in new["rerank"]:
+                        n += 1; bad += abs(new["rerank"][R] - o["rerank"][R]) > 1e-9
+            checks["nonadapter_vs_exact"] = dict(file=fex, n=n, bad=int(bad))
+            log(f">>> nhánh không dùng adapter so với bản exact ({fex}): {n} giá trị, "
+                f"{'KHỚP' if bad == 0 and n > 0 else f'{bad} LỆCH'}")
+        else:
+            log(f">>> {fex} khác tham số, bỏ qua tự kiểm với bản exact")
+    out = a.out or f"probeG_{pre}{a.tag}_s{a.seed}{sfx}.json"
+    json.dump(dict(argv=vars(a), n_sample=int(nS), N=int(N), pair=pair_info, Kstar=("c" if Kstar == "C" else "cq"),
                    cal=dict(cal04=dict(adapter=[ca, cb_, cr], dual=[da, db, dr]), adapter_cf=ols_ad,
                             adapter_insample=ols_ad_in, dual=ols_du, sig1=sig1),
                    loads=loads_all, budgets={f"{f:g}": budgets(f, T) for f in fgrid},
