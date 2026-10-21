@@ -29,6 +29,17 @@ Tự kiểm:
   (3) dòng vòng kín chạy với tập node oracle phải trùng 06 (probeL_/probeLR_ cùng seed): final, rerank, số
       payload, số record mới, f cuối, nodes, moved
 
+Bổ sung đợt 6 (mặc định giữ đúng từng số của đợt 5, tự kiểm (5) với probeE2E_ của đợt 5 nếu có):
+  --pair-src pq   adapter học trên bản tái tạo PQ c_o như 04b/06 --pair-src pq (cấu hình triển khai đầy đủ: cặp
+                  học từ PQ cộng lookup thật); tự kiểm (1) với probeG_..._pq.json, (3) với probeL_..._ku_pq.json
+  --factorial 1   tách lookup và lịch migrate: với lazy và bg, phát lại lịch migrate của lượt probe rồi đo bằng
+                  lookup thật, và phát lại lịch migrate của lượt lookup thật rồi đo bằng probe. Tự kiểm (4): phát
+                  lại lịch probe và đo bằng probe phải trùng chính lượt probe; (4b) số record mới, f cuối và tỉ lệ
+                  GT ở E1 chỉ phụ thuộc lịch nên mỗi lượt phát lại phải trùng lượt gốc của lịch đó. File ra probeE2F_...
+  --noise-replay 1  thêm một lượt phát lại lịch của lookup thật và đo lại bằng lookup thật (node gốc ngẫu nhiên
+                  khác): chênh với lượt gốc là nhiễu của chính lookup, làm mốc để đọc các ô của bảng 2x2
+  --fixed 0       bỏ phần A (dùng cho seed thêm, chỉ cần dòng)
+
 CHẠY: python3 evo/09_sim_e2e.py --tag bgebase --seed 20235956
       python3 evo/09_sim_e2e.py --dataset code100kfq --tag bgebase --seed 3 --nodes 50000 --frac 0.02 --stream 0
 """
@@ -148,6 +159,12 @@ def main():
     ap.add_argument("--window", type=int, default=150)
     ap.add_argument("--reindex-sample", type=int, default=150)
     ap.add_argument("--check-l", default="auto", help="file 06 để tự kiểm dòng oracle; auto = tên mặc định; none = bỏ")
+    ap.add_argument("--pair-src", default="exact", choices=["exact", "pq"],
+                    help="vế M0 của cặp học adapter: exact = embedding M0 đầy đủ, pq = bản tái tạo PQ của record E0")
+    ap.add_argument("--fixed", type=int, default=1, help="1 = chạy phần A (trạng thái cố định)")
+    ap.add_argument("--factorial", type=int, default=0, help="1 = phát lại chéo lịch migrate và cách đo (đợt 6)")
+    ap.add_argument("--noise-replay", type=int, default=0, help="1 = thêm lượt lịch thật + đo thật lần hai (mốc nhiễu)")
+    ap.add_argument("--check-e2e", default="auto", help="file probeE2E_ đợt 5 để tự kiểm (5); auto = tên mặc định; none = bỏ")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     t0 = time.time()
@@ -183,10 +200,11 @@ def main():
     perm = np.random.RandomState(a.seed).permutation(N)
     nS = max(a.tables * 20, int(round(a.frac * N)))
     S = perm[:nS]
-    Wr, _, _ = q3.fit_ridge_cv(E1[S], E0[S], a.seed, (1e-3, 1e-2, 1e-1, 1.0, 10.0))
-    Wf, _ = pb.fit_bridge(E0[S], E1[S], "ridge", a.seed)
-    WfT = np.ascontiguousarray(Wf.T)
     C0 = cb0[np.arange(cb0.shape[0])[None, :], cd0].reshape(N, d0).astype(np.float32)
+    X0 = E0 if a.pair_src == "exact" else C0          # vế M0 của cặp học (đợt 6: pq)
+    Wr, _, _ = q3.fit_ridge_cv(E1[S], X0[S], a.seed, (1e-3, 1e-2, 1e-1, 1.0, 10.0))
+    Wf, _ = pb.fit_bridge(X0[S], E1[S], "ridge", a.seed)
+    WfT = np.ascontiguousarray(Wf.T)
     n_i = np.linalg.norm(C0 @ Wf, axis=1)
     cb1 = pb.pq_train(E1[S], m1, a.seed)
     cd1 = pb.pq_encode(E1, cb1)
@@ -197,7 +215,7 @@ def main():
     for i in range(len(trq)):
         y.append(mc.adc_ip(qv1[i], cb1, cd1[S]))
         xd.append(mc.adc_ip(Q0[trq][i], cb0, cd0[S]))
-    Xcf, _ = mc.crossfit_adapter_x(E0, E1, C0, cb0, cd0, Q1[trq], S, S, a.folds, a.seed)
+    Xcf, _ = mc.crossfit_adapter_x(X0, E1, C0, cb0, cd0, Q1[trq], S, S, a.folds, a.seed)
     Ycf = mc.e1_scores(Q1[trq], cb1, cd1, S)
     sig1 = mc.sigma_e1(Q1[trq], E1, cb1, cd1, S, a.cal_top)
     cals = dict(AD=dict(cal_a=None, cal_b=None, ols=mc.ols_top(list(Xcf), list(Ycf), a.cal_top), sig1=sig1),
@@ -298,18 +316,20 @@ def main():
         scen += [("DU", f), ("AD", f)] if f < 1 else [("E1", f)]
     nsim = min(a.nq_sim, len(ev))
     oracle, checks = {}, {}
-    for arm, f in scen:
+    scen_run = scen if a.fixed else []
+    sfx = "" if a.pair_src == "exact" else "_pq"
+    for arm, f in scen_run:
         st = state(f)
         nm = f"{arm}|{f:g}"
         oracle[nm] = [assemble(qi, st, arm, {k: sides[k][qi] for k in side_names(st, arm)}) for qi in range(len(ev))]
     # (1) oracle khớp 04b
     pre = "" if ds == "code" else f"{ds}_"
-    fG = f"probeG_{pre}{a.tag}_s{a.seed}.json"
+    fG = f"probeG_{pre}{a.tag}_s{a.seed}{sfx}.json"
     try:
         G = json.load(open(fG))["results"] if os.path.exists(fG) else None
     except Exception as e:                                   # tự kiểm không được làm hỏng lượt chạy
         log(f"*** không đọc được {fG}: {e}"); G = None
-    if G is not None:
+    if a.fixed and G is not None:
         n, bad = 0, 0
         for arm, f in scen:
             fk = f"{f:g}"
@@ -332,7 +352,7 @@ def main():
         log(f">>> (1) chưa có {fG}, bỏ qua tự kiểm với 04b")
     # (2) đường dựng từ tập node, chạy với tập node của oracle, phải trùng oracle
     n, bad = 0, 0
-    for arm, f in scen:
+    for arm, f in scen_run:
         st = state(f)
         for qi in range(min(a.selfcheck_n, len(ev))):
             sd = {k: obs_side(k, qi, sides[k][qi].touched()) for k in side_names(st, arm)}
@@ -340,12 +360,13 @@ def main():
             for k in ("final", "rr", "reach", "nodes", "moved"):
                 n += 1; bad += mine[k] != ref[k]
             n += 1; bad += not np.array_equal(mine["fetched"], ref["fetched"])
-    checks["rebuild_from_oracle_nodes"] = dict(n=n, bad=int(bad))
-    log(f">>> (2) dựng lại từ tập node oracle so với oracle: {n} giá trị, {'KHỚP' if bad == 0 else f'{bad} LỆCH'}")
+    if a.fixed:
+        checks["rebuild_from_oracle_nodes"] = dict(n=n, bad=int(bad))
+        log(f">>> (2) dựng lại từ tập node oracle so với oracle: {n} giá trị, {'KHỚP' if bad == 0 else f'{bad} LỆCH'}")
 
     net = NetE2E(nid, a.seed, rmax=a.r_max)
     res_A = {}
-    for arm, f in scen:
+    for arm, f in scen_run:
         st = state(f)
         nm = f"{arm}|{f:g}"
         names = side_names(st, arm)
@@ -469,12 +490,13 @@ def main():
                 np.add.at(loadK, anchors1[:, docs].ravel(), 1)
             return docs
 
-        def run_stream(policy, bg_rate, mode):
+        def run_stream(policy, bg_rate, mode, sched=None, pay_cost=True):
+            """sched: danh sách record migrate ở từng lượt (phát lại một lịch có sẵn thay cho chính sách)."""
             inE1 = np.zeros(N, dtype=bool); inE1[S] = True
             load0 = np.bincount(anchors0[:, ~inE1].ravel(), minlength=a.nodes)
             loadK = np.bincount(anchors1[:, inE1].ravel(), minlength=a.nodes)
             ptr, accb = 0, 0.0
-            rec = {k: [] for k in ("final", "rr", "fetch", "new", "nodes", "moved", "f", "gtE1", "recA", "recK")}
+            rec = {k: [] for k in ("final", "rr", "fetch", "new", "nodes", "moved", "f", "gtE1", "recA", "recK", "mig")}
             rows = []
             for t in range(len(stream)):
                 qi = int(stream[t])
@@ -496,7 +518,7 @@ def main():
                         box["rA"] = recov(fd["A"], sides["A"][qi])[0] if "A" in fd else float("nan")
                         box["rK"] = recov(fd["U"], sides["U"][qi])[0] if "U" in fd else float("nan")
                         return box["r"][2]
-                    pay = (t % a.pay_every == 0)
+                    pay = pay_cost and (t % a.pay_every == 0)
                     acc = net.run_obs([keys[k][qi] for k in names], decide, sizes, a.k_query, pay)
                     fin, rr, fetched, nodes, moved = box["r"]
                     rA, rK = box["rA"], box["rK"]
@@ -505,17 +527,22 @@ def main():
                         r_["t"] = t
                         rows.append(r_)
                 new = 0
-                if policy == "lazy":
-                    new += len(migrate(fetched, inE1, load0, loadK))
-                if policy == "bg":
-                    accb += bg_rate
-                    k = int(accb); accb -= k
-                    take = []
-                    while len(take) < k and ptr < len(bg_order):
-                        d = int(bg_order[ptr]); ptr += 1
-                        if not inE1[d]:
-                            take.append(d)
-                    new += len(migrate(take, inE1, load0, loadK))
+                migs = []
+                if sched is not None:
+                    mg = migrate(sched[t], inE1, load0, loadK); new += len(mg); migs.append(mg)
+                else:
+                    if policy == "lazy":
+                        mg = migrate(fetched, inE1, load0, loadK); new += len(mg); migs.append(mg)
+                    if policy == "bg":
+                        accb += bg_rate
+                        k = int(accb); accb -= k
+                        take = []
+                        while len(take) < k and ptr < len(bg_order):
+                            d = int(bg_order[ptr]); ptr += 1
+                            if not inE1[d]:
+                                take.append(d)
+                        mg = migrate(take, inE1, load0, loadK); new += len(mg); migs.append(mg)
+                rec["mig"].append(np.concatenate(migs) if migs else empty)
                 for kk, v in (("final", fin), ("rr", rr), ("fetch", len(fetched)), ("new", new), ("nodes", nodes),
                               ("moved", moved), ("f", float(inE1.mean())), ("recA", rA), ("recK", rK)):
                     rec[kk].append(v)
@@ -539,8 +566,9 @@ def main():
 
         pols = [p for p in ("static", "lazy", "bg") if p in a.policies.split(",")]
         stream_out = {}
+        done_by = {}
         for mode in ("oracle", "sim"):
-            done = {}
+            done = done_by.setdefault(mode, {})
             for pol in pols:
                 rate = 0.0
                 if pol == "bg":
@@ -553,6 +581,8 @@ def main():
                 tt = totals(rec)
                 entry = stream_out.setdefault(pol, {})
                 entry[mode] = dict(totals=tt, windows=windows(rec, a.window), bg_rate=rate)
+                if mode == "oracle" and a.factorial:
+                    entry["oracle"]["per_arrival"] = dict(final=rec["final"], rr=rec["rr"])
                 if mode == "sim":
                     migr = np.asarray(rec["new"], dtype=float)
                     entry["sim"]["client"] = m8.summarize([{k: v for k, v in r_.items() if k != "t"} for r_ in rows]) if rows else None
@@ -566,13 +596,44 @@ def main():
                     + (f" tìm lại node A={100 * tt['found_A']:.0f}% E1={100 * tt['found_K']:.0f}%" if mode == "sim" else "")
                     + (f" | RPC={c['rpc_total']:7.0f} p50={c['lat_total_ms_p50'] / 1000:5.2f}s" if c else "")
                     + f"  ({time.time() - tt0:.0f}s)")
+        # ---------------- đợt 6: phát lại chéo lịch migrate và cách đo
+        if a.factorial:
+            for pol in [p for p in ("lazy", "bg") if p in done_by.get("oracle", {}) and p in done_by.get("sim", {})]:
+                entry = stream_out[pol]
+                rc, _ = run_stream(pol, 0.0, "oracle", sched=done_by["oracle"][pol]["mig"])
+                tc, tr_ = totals(rc), entry["oracle"]["totals"]
+                ks = ("final", "rr", "fetch", "new", "f_end", "nodes", "moved", "gtE1")
+                bad = sum(abs(tc[k] - tr_[k]) > 1e-9 for k in ks)
+                checks.setdefault("replay_identity", {})[pol] = dict(n=len(ks), bad=int(bad))
+                log(f">>> (4) {pol}: phát lại lịch probe, đo bằng probe, so với lượt probe: {len(ks)} giá trị, "
+                    f"{'KHỚP' if bad == 0 else f'{bad} LỆCH'}")
+                tt0 = time.time()
+                reps = dict(sched_probe_eval_lookup=("oracle", "sim"), sched_lookup_eval_probe=("sim", "oracle"))
+                if a.noise_replay:
+                    reps["sched_lookup_eval_lookup_again"] = ("sim", "sim")
+                entry["replay"] = {}
+                n4, bad4 = 0, 0
+                for nm_r, (src, ev_mode) in reps.items():
+                    rr_, _ = run_stream(pol, 0.0, ev_mode, sched=done_by[src][pol]["mig"], pay_cost=False)
+                    tr2 = totals(rr_)
+                    entry["replay"][nm_r] = dict(totals=tr2, windows=windows(rr_, a.window),
+                                                 per_arrival=dict(final=rr_["final"], rr=rr_["rr"]))
+                    ref2 = entry[src]["totals"]
+                    for k in ("new", "f_end", "gtE1"):
+                        n4 += 1; bad4 += abs(tr2[k] - ref2[k]) > 1e-9
+                    log(f"  phát lại {pol:4s} lịch {'probe' if src == 'oracle' else 'thật':5s} đo "
+                        f"{'probe' if ev_mode == 'oracle' else 'thật':5s}: final={tr2['final']:5.1f} rerank={tr2['rr']:5.1f} "
+                        f"GT ở E1={tr2['gtE1']:4.1f}%  ({time.time() - tt0:.0f}s)")
+                checks.setdefault("replay_schedule", {})[pol] = dict(n=n4, bad=int(bad4))
+                log(f">>> (4b) {pol}: số mới, f cuối, GT ở E1 của các lượt phát lại so với lượt gốc của lịch: {n4} giá trị, "
+                    f"{'KHỚP' if bad4 == 0 else f'{bad4} LỆCH'}")
         # (3) dòng oracle khớp 06
         f6 = None
         if a.check_l != "none":
             if a.check_l != "auto":
                 f6 = a.check_l
             else:
-                for cand in (f"probeL_{pre}{a.tag}_s{a.seed}_ku.json", f"probeLR_{pre}{a.tag}_s{a.seed}.json"):
+                for cand in (f"probeL_{pre}{a.tag}_s{a.seed}_ku{sfx}.json", f"probeLR_{pre}{a.tag}_s{a.seed}{sfx}.json"):
                     if os.path.exists(cand):
                         f6 = cand; break
         if f6 and os.path.exists(f6):
@@ -600,7 +661,33 @@ def main():
             log(">>> (3) không có file 06 để tự kiểm dòng oracle")
         out["stream"] = dict(zipf=z, length=len(stream), runs=stream_out)
 
-    fn = a.out or f"probeE2E_{pre}{a.tag}_s{a.seed}.json"
+    base = "probeE2F" if a.factorial else "probeE2E"
+    fn = a.out or f"{base}_{pre}{a.tag}_s{a.seed}{sfx}.json"
+    # (5) so với lượt đợt 5 cùng seed (cùng chuỗi ngẫu nhiên nếu phần A và tham số giống hệt)
+    fE = None if a.check_e2e == "none" else (a.check_e2e if a.check_e2e != "auto" else f"probeE2E_{pre}{a.tag}_s{a.seed}{sfx}.json")
+    if fE and os.path.exists(fE) and os.path.abspath(fE) != os.path.abspath(fn):
+        try:
+            Q = json.load(open(fE))
+            same = all(Q["argv"].get(k) == getattr(a, k) for k in (
+                "dataset", "tag", "seed", "nodes", "frac", "nq", "nq_sim", "nq_pay", "fmig", "stream", "zipf", "n_heldout",
+                "pay_every", "policies", "selfcheck_n", "tables", "k_query", "probes", "cbits", "dsub", "kappa", "R", "need",
+                "cal_top", "folds", "r_max", "reindex_sample"))
+            if same and a.fixed:
+                n, bad = 0, 0
+                for nm_, r_ in res_A.items():
+                    for side in ("oracle", "sim"):
+                        for k in ("final_r5", "rr", "reach", "fetch"):
+                            n += 1; bad += abs(r_[side][k] - Q["fixed"][nm_][side][k]) > 1e-9
+                for pol, e_ in (out.get("stream") or {}).get("runs", {}).items():
+                    for side in ("oracle", "sim"):
+                        for k in ("final", "rr", "fetch", "new", "f_end", "gtE1"):
+                            n += 1; bad += abs(e_[side]["totals"][k] - Q["stream"]["runs"][pol][side]["totals"][k]) > 1e-9
+                checks["vs_round5"] = dict(file=fE, n=n, bad=int(bad))
+                log(f">>> (5) so với đợt 5 ({fE}): {n} giá trị, {'KHỚP' if bad == 0 else f'{bad} LỆCH'}")
+            else:
+                log(f">>> (5) {fE} khác tham số hoặc không chạy phần A, bỏ qua")
+        except Exception as e:
+            log(f"*** tự kiểm (5) với {fE} lỗi: {e}")
     json.dump(out, open(fn, "w"), indent=1)
     log(f"\n-> {fn}   ({time.time() - t0:.0f}s)")
 
