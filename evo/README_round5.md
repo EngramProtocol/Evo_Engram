@@ -44,7 +44,7 @@ git push origin main --tags
 **Trên server:**
 
 ```bash
-ssh research@103.67.203.71
+ssh <server>
 cd ~/Evo_Engram
 git fetch origin --tags && git checkout evo-r5-v1
 sha256sum -c evo/SHA256SUMS_round5

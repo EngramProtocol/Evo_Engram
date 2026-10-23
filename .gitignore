@@ -80,3 +80,11 @@ probeC_*.json
 probeD_*.json
 bench_*.json
 __pycache__/
+
+# Evo-Engram result files and run logs (written to the repository root and evo/)
+probe*.json
+bench_*.json
+evo/r[0-9]*_logs/
+evo/r[0-9]*_summary*.txt
+evo/round[0-9]*_all.txt
+evo/r[0-9]*_model_revisions.txt

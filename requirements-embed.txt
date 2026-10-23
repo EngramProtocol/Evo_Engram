@@ -1,0 +1,10 @@
+# Embedding steps only: evo/01_embed_m1.py, evo/05_bench_cpu.py, prepare/04_evo_colab_embed.py.
+# Versions recorded in the round-4 log of the CPU server. For the CPU build of torch:
+#   pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0
+transformers==5.17.0
+sentence-transformers==6.1.0
+# Also needed by prepare/04_evo_colab_embed.py; their versions were not recorded.
+huggingface_hub
+pandas
+pyarrow

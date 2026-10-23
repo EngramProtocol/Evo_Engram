@@ -49,7 +49,7 @@ tự kiểm (5) so 108 giá trị mỗi job với `probeE2E_*` đợt 5 và khô
 **Trên laptop** (repo Evo_Engram, nhánh `main`, đang ở tag `evo-r5-v1`):
 
 ```bash
-cd /home/khanh/Evo_Engram
+cd Evo_Engram
 git checkout main && git pull
 git am ~/Downloads/0001-evo-dot-6*.patch
 git tag -a evo-r6-v1 -m "dot 6: kiem soat lookup va lich migrate, PQ + lookup that"
@@ -59,7 +59,7 @@ git push origin main --tags
 **Trên server:**
 
 ```bash
-ssh research@103.67.203.71
+ssh <server>
 cd ~/Evo_Engram
 git fetch origin --tags && git checkout evo-r6-v1
 sha256sum -c evo/SHA256SUMS_round6
