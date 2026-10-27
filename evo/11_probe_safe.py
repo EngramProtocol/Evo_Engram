@@ -31,17 +31,34 @@ client đọc tiếp danh sách E0 (tối đa --bonus-mult x R vị trí, vẫn 
 chỉ có ở E0, các object dual gặp trên đường là phần thêm. --dual-slots shared tính chúng như record thường.
 
 Đo thêm so với 06: tỉ lệ object dual (lưu trữ E0 thừa) cuối dòng và trung bình, tỉ lệ E0 còn hoạt động,
-số xác nhận, số retire, số object dual nhận từ phía E0 mỗi truy vấn (byte trả về thêm); nếu GT của M0 có
+số xác nhận, số retire, số object dual nhận từ phía E0 mỗi truy vấn (byte trả về thêm), số record các peer được
+hỏi phải chấm mỗi truy vấn (scan, cả hai phía); nếu GT của M0 có
 source_corpus_index (code100kfq): tỉ lệ hàm gốc của query nằm trong top-5 trước và sau rerank (gold_final, gold_rr).
 
 Tự kiểm: static, lazy, bg (Zipf 1, PROB) phải trùng từng số với probeL_<pre><tag>_s<seed>_ku.json của 06
-(totals và cửa sổ) nếu file có ở thư mục hiện tại.
+(totals và cửa sổ) nếu file có ở thư mục hiện tại. Chỉ chạy khi --e1-place u; khi lệch, in tối đa 10 giá trị lệch.
+
+Bổ sung đợt 7b:
+  lazyVbg   lazyV<c> (c = số đầu của --confirms) cộng migrate nền ngẫu nhiên, record nền retire ngay như bg. Tốc độ
+            nền chọn để tổng số record công bố bằng của lazy: (số record lazy công bố − số record lazyV<c> công bố)
+            / độ dài dòng. So với lazy ở cùng ngân sách nhúng lại.
+  lazyVbgD  như lazyVbg nhưng record nền cũng công bố dạng dual (giữ bản E0, nâng cấp mã E1 tại chỗ) và chỉ retire
+            sau c xác nhận native, như record do truy vấn kéo về.
+  --e1-place u | itq_q | pca_q | srp_cq: cách đặt record của epoch E1. u là SRP không trừ tâm như bài (mặc định,
+            giữ đúng từng số đợt 7). Các cách còn lại dùng đúng hàm của 10_probe_placement.py, học trên mẫu S. Với
+            cách học, tự kiểm index native ở f = 1 (300 query đánh giá, L = 5, T = 8) phải trùng biến thể cùng tên
+            trong probeP_<pre><tag>_s<seed>.json của đợt 7 (reach, final, rerank@20, ứng viên, peer).
 
 CHẠY: python3 evo/11_probe_safe.py --tag arctic --dataset code100kfq --seed 3 --nodes 50000 --frac 0.02
 """
-import argparse, json, os, random, time
+import argparse, importlib.util, json, os, random, time
 import numpy as np
 import me_common as mc
+
+_here = os.path.dirname(os.path.abspath(__file__))
+_sp10 = importlib.util.spec_from_file_location("p10", os.path.join(_here, "10_probe_placement.py"))
+p10 = importlib.util.module_from_spec(_sp10)
+_sp10.loader.exec_module(p10)
 
 np.seterr(invalid='ignore', divide='ignore')
 q3, pb = mc.q3, mc.pb
@@ -78,6 +95,11 @@ def main():
     ap.add_argument("--dual-slots", default="bonus", choices=["bonus", "shared"],
                     help="bonus: object dual từ phía E0 không tính vào Rk record E0; shared: tính như record thường")
     ap.add_argument("--bonus-mult", type=int, default=3, help="phía E0 đọc tối đa bonus_mult x R vị trí")
+    ap.add_argument("--e1-place", default="u", choices=["u", "itq_q", "pca_q", "srp_cq"],
+                    help="cách đặt record E1: u = SRP không trừ tâm như bài; còn lại như 10_probe_placement.py")
+    ap.add_argument("--k-pca", type=int, default=128)
+    ap.add_argument("--itq-iters", type=int, default=50)
+    ap.add_argument("--check-10", default="auto", help="probeP của đợt 7 để tự kiểm placement học; none = bỏ")
     ap.add_argument("--check-06", default="auto")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
@@ -114,7 +136,7 @@ def main():
     S = perm[:nS]
     log("=" * 78)
     log(f"[11] dataset={ds} tag={a.tag} seed={a.seed} N={N} S={nS} dòng={a.stream} zipf={zipfs} R={a.R} "
-        f"chính sách={a.policies} xác nhận={confirms}")
+        f"chính sách={a.policies} xác nhận={confirms} đặt E1={a.e1_place}  (numpy {np.__version__})")
 
     # ---------------- adapter, PQ E1, chỉ mục: đúng như 06 với khoá E1 'u'
     m0 = cb0.shape[0]
@@ -126,7 +148,22 @@ def main():
     cb1 = pb.pq_train(E1[S], m1, a.seed)
     cd1 = pb.pq_encode(E1, cb1)
     anchors0 = pb.build_index(E0, P0, nid)
-    anchorsK = pb.build_index(E1, P1, nid)
+    q1all = l2norm(Q1[ev])
+    if a.e1_place == "u":
+        anchorsK = pb.build_index(E1, P1, nid)
+        NK = mc.route_keys(q1all, P1, nid, a.k_query, T, a.cbits)
+    else:
+        # placement học trên S, đúng hàm của 10 (bảng đầu của Lmax lớn trùng Lmax nhỏ)
+        mu_d = E1[S].mean(0).astype(np.float32)
+        mu_q = Q1[trq].mean(0).astype(np.float32) if len(trq) else mu_d
+        PV = p10.make_variant(a.e1_place, E1[S], a.tables, a.seed, P1, mu_d, mu_q, a.k_pca, a.itq_iters)
+        anchorsK = np.stack([pb.nearest_node(p10.pack(p10.doc_bits(E1, W, t, PV["cd"])), nid)
+                             for W, t in zip(PV["W"], PV["t"])])
+        keys = np.stack(p10.probe_keys(q1all, PV["W"], PV["t"], PV["cq"], T, a.cbits), axis=1)
+        NK = pb.knn_nodes(keys.reshape(-1), nid, a.k_query).reshape(len(ev), a.tables, T, a.k_query)
+    stK = mc.load_stats(anchorsK, a.nodes)
+    log(f"tải lưu trữ E1 ({a.e1_place}, khi mọi record ở E1): max={stK['max']} rỗng={100 * stK['empty_frac']:.0f}% "
+        f"top1%={100 * stK['top1pct_share']:.1f}%")
     Xcf, _ = mc.crossfit_adapter_x(E0, E1, C0, cb0, cd0, Q1[trq], S, S, a.folds, a.seed)
     Ycf = mc.e1_scores(Q1[trq], cb1, cd1, S)
     ols_ad = mc.ols_top(list(Xcf), list(Ycf), a.cal_top)
@@ -135,8 +172,6 @@ def main():
     log(f"hiệu chỉnh cross-fit: a={ols_ad['a']:.3f} b={ols_ad['b']:+.3f} sigma0={ols_ad['sig']:.4f} "
         f"r={ols_ad['r']:.3f}; sigma1={sig1:.4f}")
 
-    q1all = l2norm(Q1[ev])
-    NK = mc.route_keys(q1all, P1, nid, a.k_query, T, a.cbits)
     sides_K = [mc.Side2(NK[i], anchorsK, a.nodes,
                         (lambda r, i=i: (-mc.adc_l2(q1all[i], cb1, cd1[r]), mc.adc_ip(q1all[i], cb1, cd1[r]))))
                for i in range(len(ev))]
@@ -151,6 +186,41 @@ def main():
         return f
     sides_A = [mc.Side2(NA[i], anchors0, a.nodes, fa(i)) for i in range(len(ev))]
     log(f"định tuyến và chấm điểm xong ({time.time() - t0:.0f}s)")
+
+    # ---------------- tự kiểm placement học với 10 (index native ở f = 1, như E1ONLY)
+    pre = "" if ds == "code" else f"{ds}_"
+    check10 = None
+    if a.e1_place != "u":
+        allon = np.ones(N, dtype=bool)
+        acc = dict(reach=[], final=[], rr=[], cand=[], nodes=[])
+        for i in range(len(ev)):
+            g = set(gt5_all[ev[i]].tolist())
+            n_, lst_, _ = sides_K[i].ranked(allon, a.kappa, 20)
+            acc["reach"].append(len(set(sides_K[i].reach_set().tolist()) & g) / 5.0)
+            acc["final"].append(len(set(lst_[:5].tolist()) & g) / 5.0)
+            acc["rr"].append(mc.rerank_hits(lst_[:20], E1, q1all[i], g))
+            acc["cand"].append(n_); acc["nodes"].append(len(sides_K[i].touched()))
+        nat1 = dict(reach_r5=100 * float(np.mean(acc["reach"])), final_r5=100 * float(np.mean(acc["final"])),
+                    rr20=100 * float(np.mean(acc["rr"])), cand=float(np.mean(acc["cand"])),
+                    nodes=float(np.mean(acc["nodes"])))
+        log(f"index native {a.e1_place} ở f = 1: reach={nat1['reach_r5']:.1f} final={nat1['final_r5']:.1f} "
+            f"rr20={nat1['rr20']:.1f} ứng viên={nat1['cand']:.0f} peer={nat1['nodes']:.0f}")
+        f10 = f"probeP_{pre}{a.tag}_s{a.seed}.json" if a.check_10 == "auto" else a.check_10
+        if f10 != "none" and os.path.exists(f10):
+            P = json.load(open(f10))
+            same = all(P["argv"].get(k) == v for k, v in (("nodes", a.nodes), ("nq", a.nq), ("frac", a.frac),
+                                                          ("k_query", a.k_query), ("kappa", a.kappa), ("cbits", a.cbits),
+                                                          ("dsub", a.dsub), ("k_pca", a.k_pca), ("itq_iters", a.itq_iters)))
+            r10 = P["variants"].get(a.e1_place, {}).get("results", {}).get(str(a.tables), {}).get(str(T))
+            if same and r10 is not None:
+                bad10 = [(k, r10[k], nat1[k]) for k in nat1 if abs(r10[k] - nat1[k]) > 1e-9]
+                check10 = dict(file=f10, n=len(nat1), bad=len(bad10), diffs=bad10)
+                log(f">>> placement {a.e1_place} so với 10 ({f10}, L={a.tables}, T={T}): {len(nat1)} giá trị, "
+                    f"{'KHỚP' if not bad10 else f'{len(bad10)} LỆCH {bad10}'}")
+            else:
+                log(f">>> không tự kiểm được placement với {f10} (tham số khác hoặc thiếu biến thể)")
+        else:
+            log(f">>> bỏ qua tự kiểm placement với 10 ({f10} không có)")
 
     rng = np.random.RandomState(a.seed + 41)
     order = rng.permutation(len(ev))
@@ -167,14 +237,14 @@ def main():
         dual_any = bool((act0 & inE1).any())
         if dual_any and a.dual_slots == "bonus":
             # object dual không chiếm chỗ: client đọc tiếp danh sách E0 tới khi đủ Rk record chỉ có ở E0
-            _, l0, x0 = sA.ranked(act0, a.kappa, a.bonus_mult * Rk)
+            n0, l0, x0 = sA.ranked(act0, a.kappa, a.bonus_mult * Rk)
             l0, x0 = np.asarray(l0, dtype=np.int64), np.asarray(x0)
             only = ~inE1[l0]
             cut = len(l0) if only.sum() < Rk else int(np.flatnonzero(only)[Rk - 1]) + 1
             l0, x0 = l0[:cut], x0[:cut]
         else:
-            _, l0, x0 = sA.ranked(act0, a.kappa, Rk)
-        _, l1, y1 = sK.ranked(inE1, a.kappa, Rk)
+            n0, l0, x0 = sA.ranked(act0, a.kappa, Rk)
+        n1, l1, y1 = sK.ranked(inE1, a.kappa, Rk)
         l0, x0 = np.asarray(l0, dtype=np.int64), np.asarray(x0)
         l1f = np.asarray(l1, dtype=np.int64)              # danh sách tìm được qua khoá E1 (dùng để xác nhận)
         ex_all = l0[inE1[l0]] if len(l0) else l0          # object dual nhận từ phía E0 (thêm byte trả về)
@@ -222,7 +292,8 @@ def main():
                  + (np.minimum(load["K"][tK], a.kappa).sum() if has1 else 0))
         hints = pool[fet & ~inE1[pool]]
         nbonus = int(len(ex_all))
-        return fin, rr, pool[fet], nodes, int(moved), l1f, hints, nbonus, gfr
+        scan = (n0 if has0 else 0) + (n1 if has1 else 0)   # record còn hoạt động mà các peer được hỏi phải chấm
+        return fin, rr, pool[fet], nodes, int(moved), l1f, hints, nbonus, gfr, int(scan)
 
     load = {}
 
@@ -251,7 +322,7 @@ def main():
         seen = np.zeros(len(ev), dtype=bool)
         ptr, accb = 0, 0.0
         rec = {k: [] for k in ("final", "rr", "fetch", "new", "nodes", "moved", "f", "rep", "gtE1",
-                               "rep_exact", "qlen", "dual", "act0", "conf", "retired", "bonus", "gf", "gr")}
+                               "rep_exact", "qlen", "dual", "act0", "conf", "retired", "bonus", "gf", "gr", "scan")}
         snaps = {}
         lazyish = policy in ("lazy", "lazyD") or policy.startswith("lazyV")
         for t in range(len(stream) + 1):
@@ -260,13 +331,14 @@ def main():
                 snaps[str(t)] = dict(final=100 * np.mean([h[0] for h in hs]), rr=100 * np.mean([h[1] for h in hs]),
                                      f=float(inE1.mean()), dual=float((inE1 & act0).mean()),
                                      gold_final=100 * float(np.mean([h[8][0] for h in hs])),
-                                     gold_rr=100 * float(np.mean([h[8][1] for h in hs])))
+                                     gold_rr=100 * float(np.mean([h[8][1] for h in hs])),
+                                     scan=float(np.mean([h[9] for h in hs])))
             if t == len(stream):
                 break
             qi = int(stream[t])
             gq = gt5_all[ev[qi]]
             gtE1 = float(inE1[np.asarray(gq)].mean())
-            fin, rr, fetched, nodes, moved, l1, hints, nbonus, gfr = one_query(qi, act0, inE1)
+            fin, rr, fetched, nodes, moved, l1, hints, nbonus, gfr, scan = one_query(qi, act0, inE1)
             new, nconf, nret = 0, 0, 0
             if lazyish:
                 if policy.startswith("lazyV"):
@@ -276,7 +348,7 @@ def main():
                         nret = len(retire_e0(dl[conf[dl] >= confirm], act0))
                 mg = publish(hints if policy != "lazy" else fetched, inE1, act0, retire=(policy == "lazy"))
                 new += len(mg)
-            if policy in ("bg", "bgV"):
+            if policy in ("bg", "bgV", "lazyVbg", "lazyVbgD"):
                 accb += bg_rate
                 k = int(accb); accb -= k
                 take = []
@@ -284,12 +356,12 @@ def main():
                     x = int(bg_order[ptr]); ptr += 1
                     if not inE1[x]:
                         take.append(x)
-                new += len(publish(take, inE1, act0, retire=True))
+                new += len(publish(take, inE1, act0, retire=(policy != "lazyVbgD")))
             for kk, v in (("final", fin), ("rr", rr), ("fetch", len(fetched)), ("new", new), ("nodes", nodes),
                           ("moved", moved), ("f", float(inE1.mean())), ("rep", bool(seen[qi])), ("gtE1", gtE1),
                           ("rep_exact", bool(seen[qi])), ("qlen", 0), ("dual", float((inE1 & act0).mean())),
                           ("act0", float(act0.mean())), ("conf", nconf), ("retired", nret), ("bonus", nbonus),
-                          ("gf", gfr[0]), ("gr", gfr[1])):
+                          ("gf", gfr[0]), ("gr", gfr[1]), ("scan", scan)):
                 rec[kk].append(v)
             seen[qi] = True
         return rec, snaps
@@ -328,9 +400,11 @@ def main():
                     dual_end=100 * float(rec["dual"][-1]), dual_mean=100 * float(np.mean(rec["dual"])),
                     act0_end=100 * float(rec["act0"][-1]), conf_total=int(np.sum(rec["conf"])),
                     retired_total=int(np.sum(rec["retired"])), dual_from_e0=float(np.mean(rec["bonus"])),
-                    gold_final=100 * float(np.mean(rec["gf"])), gold_rr=100 * float(np.mean(rec["gr"])))
+                    gold_final=100 * float(np.mean(rec["gf"])), gold_rr=100 * float(np.mean(rec["gr"])),
+                    scan=float(np.mean(rec["scan"])))
 
-    out = dict(argv=vars(a), N=int(N), n_sample=int(nS), cal=ols_ad, sig1=sig1, runs={}, check_06=None)
+    out = dict(argv=vars(a), N=int(N), n_sample=int(nS), cal=ols_ad, sig1=sig1, runs={}, check_06=None,
+               check_10=check10, numpy=np.__version__, e1_storage=stK)
     pols = a.policies.split(",")
     for z in zipfs:
         ranks = np.random.RandomState(a.seed + 43).permutation(len(pool_q))
@@ -347,15 +421,21 @@ def main():
                 plan += [(f"bgV{c}", "bgV", 0, f"lazyV{c}") for c in confirms]
             elif pol == "bg":
                 plan.append(("bg", "bg", 0, "lazy"))
+            elif pol in ("lazyVbg", "lazyVbgD"):
+                plan.append((pol, pol, confirms[0], ("lazy", f"lazyV{confirms[0]}")))
             else:
                 plan.append((pol, pol, 0, None))
         for name, pol, c, need in plan:
             rate = 0.0
-            if need is not None:
+            if isinstance(need, tuple):                   # lazyVbg: bù cho đủ số record lazy công bố
+                if any(x not in done for x in need):
+                    log(f"  ({name} cần {need}) bỏ qua"); continue
+                rate = max(0.0, (done[need[0]]["f"][-1] - done[need[1]]["f"][-1]) * N / a.stream)
+            elif need is not None:
                 if need not in done:
                     log(f"  ({name} cần {need}) bỏ qua"); continue
                 rate = (done[need]["f"][-1] * N - nS) / a.stream
-            pol_run = pol if not pol.startswith("lazyV") else f"lazyV{c}"
+            pol_run = f"lazyV{c}" if pol == "lazyV" else pol
             rec, snaps = simulate(stream, pol_run, rate, confirm=c)
             done[name] = rec
             tt = totals(rec); tt["bg_rate"] = rate
@@ -364,15 +444,21 @@ def main():
             log(f"  {name:7s} final={tt['final']:5.1f} rerank={tt['rr']:5.1f} tải/query={tt['fetch']:4.1f} "
                 f"record mới/query={tt['new']:4.2f} f cuối={100 * tt['f_end']:4.1f}% dual cuối={tt['dual_end']:4.1f}% "
                 f"(TB {tt['dual_mean']:4.1f}%) E0 còn={tt['act0_end']:4.1f}% xác nhận={tt['conf_total']} "
-                f"retire={tt['retired_total']} dual từ E0/query={tt['dual_from_e0']:4.1f}  [{time.time() - t0:.0f}s]")
+                f"retire={tt['retired_total']} dual từ E0/query={tt['dual_from_e0']:4.1f} chấm/query={tt['scan']:7.0f}  "
+                f"[{time.time() - t0:.0f}s]")
             log("     giữ riêng " + " ".join(f"t{k2}:{v['final']:4.1f}/{v['rr']:4.1f}" for k2, v in snaps.items()))
 
     # ---------------- tự kiểm với 06
-    pre = "" if ds == "code" else f"{ds}_"
     f06 = (f"probeL_{pre}{a.tag}_s{a.seed}_ku.json" if a.check_06 == "auto" else a.check_06)
-    if f06 != "none" and os.path.exists(f06):
+    if a.e1_place != "u":
+        log(">>> bỏ qua tự kiểm với 06 (placement E1 khác bài)")
+    elif f06 != "none" and os.path.exists(f06):
         old = json.load(open(f06))
         n, bad = 0, 0
+        diffs = []
+
+        def isbad(x, y):
+            return not (abs(x - y) <= 1e-9 or (x != x and y != y))
         for pol in ("static", "lazy", "bg"):
             for z in zipfs:
                 k = f"z{z:g}|PROB|{pol}"
@@ -380,16 +466,24 @@ def main():
                     r, nw = old["runs"][k], out["runs"][k]
                     for kk, v in r["totals"].items():
                         if kk in nw["totals"] and kk not in ("qlen_mean", "qlen_end"):
-                            n += 1; bad += not (abs(nw["totals"][kk] - v) <= 1e-9 or (v != v and nw["totals"][kk] != nw["totals"][kk]))
-                    for x, y in zip(r["windows"], nw["windows"]):
+                            n += 1
+                            if isbad(nw["totals"][kk], v):
+                                bad += 1; diffs.append((k, "totals", kk, v, nw["totals"][kk]))
+                    for wi, (x, y) in enumerate(zip(r["windows"], nw["windows"])):
                         for kk in ("final", "rr", "fetch", "new", "f", "gtE1"):
-                            n += 1; bad += not (abs(x[kk] - y[kk]) <= 1e-9 or (x[kk] != x[kk] and y[kk] != y[kk]))
+                            n += 1
+                            if isbad(x[kk], y[kk]):
+                                bad += 1; diffs.append((k, f"window{wi}", kk, x[kk], y[kk]))
                     for t_, sv in r.get("snapshots", {}).items():
                         if t_ in nw["snapshots"]:
                             for kk in ("final", "rr", "f"):
-                                n += 1; bad += abs(sv[kk] - nw["snapshots"][t_][kk]) > 1e-9
-        out["check_06"] = dict(file=f06, n=n, bad=int(bad))
+                                n += 1
+                                if isbad(sv[kk], nw["snapshots"][t_][kk]):
+                                    bad += 1; diffs.append((k, f"snap{t_}", kk, sv[kk], nw["snapshots"][t_][kk]))
+        out["check_06"] = dict(file=f06, n=n, bad=int(bad), diffs=diffs[:10])
         log(f">>> so với 06 ({f06}): {n} giá trị, {'KHỚP' if bad == 0 and n > 0 else f'{bad} LỆCH'}")
+        for dd in diffs[:10]:
+            log(f"    lệch: {dd}")
     else:
         log(f">>> bỏ qua tự kiểm với 06 ({f06} không có)")
 

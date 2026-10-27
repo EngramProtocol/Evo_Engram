@@ -167,6 +167,10 @@ def main():
     ap.add_argument("--k-pca", type=int, default=128)
     ap.add_argument("--itq-iters", type=int, default=50)
     ap.add_argument("--pairs", type=int, default=5000, help="số cặp document ngẫu nhiên để đo cosine trung bình")
+    ap.add_argument("--aniso-only", type=int, default=0,
+                    help="1: chỉ đo độ dị hướng, xác suất trùng bucket 16 bit dự đoán (trường trung bình và công thức góc "
+                         "chính xác) và đo thật, rồi ghi probeA_*.json; không dựng index, không chấm điểm")
+    ap.add_argument("--aniso-pairs", type=int, default=200000, help="số cặp document cho công thức góc ở --aniso-only")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     t0 = time.time()
@@ -202,17 +206,11 @@ def main():
     perm = np.random.RandomState(a.seed).permutation(N)
     nS = max(a.tables_ref * 20, int(round(a.frac * N)))
     S = perm[:nS]
-    if a.space == "m1":
-        cb = pb.pq_train(E[S], d // a.dsub, a.seed)
-        cd = pb.pq_encode(E, cb)
-    else:
-        cb = np.load(f"{D}/{ds}_pq_codebook_m512.npy").astype(np.float32)
-        cd = np.load(f"{D}/{ds}_pq_codes_m512.npy")
     mu_d = E[S].mean(0).astype(np.float32)
     mu_q = Qall[trq].mean(0).astype(np.float32) if len(trq) else mu_d
     log("=" * 78)
     log(f"[10] dataset={ds} space={a.space} tag={tag} seed={a.seed} N={N} d={d} nodes={a.nodes} S={nS} "
-        f"Ls={Ls} Ts={Ts} K={a.k_query} kappa={a.kappa} biến thể={variants}")
+        f"Ls={Ls} Ts={Ts} K={a.k_query} kappa={a.kappa} biến thể={variants}  (numpy {np.__version__})")
 
     # ---------------- độ dị hướng và dự đoán của mô hình bit lệch
     rs = np.random.RandomState(a.seed + 7)
@@ -230,6 +228,79 @@ def main():
     log(f"dị hướng: |mu_d|={aniso['mu_d_norm']:.3f} |mu_q|={aniso['mu_q_norm']:.3f} cos(mu_d,mu_q)={aniso['cos_mu']:.3f} "
         f"cos TB giữa document={cbar:.3f} a={an:.2f} -> va chạm/bit dự đoán={col_pred:.3f}, "
         f"bucket 16 bit hiệu dụng dự đoán={aniso['eff_buckets16_pred']:,.0f}")
+    pre = "" if ds == "code" else f"{ds}_"
+
+    if a.aniso_only:
+        # Với siêu phẳng Gauss độc lập qua gốc, hai vector góc theta trùng một bit với xác suất 1 - theta/pi
+        # (Goemans-Williamson), nên trùng cả k bit với xác suất (1 - theta/pi)^k. Kỳ vọng trên cặp document ngẫu
+        # nhiên là xác suất trùng bucket k bit; nghịch đảo là số bucket hiệu dụng. Mô hình trường trung bình ở trên
+        # thay phân bố góc bằng một vector trung bình chung cộng phần dư đẳng hướng.
+        K16 = 16
+        rs2 = np.random.RandomState(a.seed + 11)
+        Ec = l2norm(E - mu_d)
+
+        def pair_pred(X):
+            tot, cnt, near = 0.0, 0, 0
+            left = a.aniso_pairs
+            while left > 0:
+                m = min(20000, left); left -= m
+                j1, j2 = rs2.randint(N, size=m), rs2.randint(N, size=m)
+                ok = j1 != j2
+                c = np.clip((X[j1[ok]] * X[j2[ok]]).sum(1), -1.0, 1.0)
+                tot += float(((1.0 - np.arccos(c) / np.pi) ** K16).sum()); cnt += int(ok.sum())
+                near += int((c > 0.99).sum())
+            return tot / cnt, near / cnt
+
+        def meas_coll(Xproj):
+            keys = prefix16(Xproj[:, :K16] > 0)
+            _, cnt = np.unique(keys, return_counts=True)
+            return float((cnt * (cnt - 1.0)).sum() / (N * (N - 1.0))), keys
+
+        def q_pred(Qn, X):
+            v = []
+            for i in range(0, len(Qn), 50):
+                c = np.clip(Qn[i:i + 50] @ X.T, -1.0, 1.0)
+                v.append(((1.0 - np.arccos(c) / np.pi) ** K16).mean(1))
+            return float(np.concatenate(v).mean())
+
+        qn = l2norm(Qall[ev])
+        qc = l2norm(qn - mu_d)                                     # khoá query trừ tâm như 04b: q chuẩn hoá rồi trừ mu_d
+        ext = dict(pairs=a.aniso_pairs, k=K16, coll_pred_meanfield=float(col_pred ** K16))
+        ext["coll_pred_exact_u"], ext["near_dup_frac_u"] = pair_pred(En)
+        ext["coll_pred_exact_c"], ext["near_dup_frac_c"] = pair_pred(Ec)
+        ext["qfrac_pred_u"], ext["qfrac_pred_c"] = q_pred(qn, En), q_pred(qc, Ec)
+        mu_, mc_, qu_, qc_ = [], [], [], []
+        for P in P_rand[:a.tables_ref]:
+            cu, ku = meas_coll(E @ P)
+            cc, kc = meas_coll((E - mu_d) @ P)
+            mu_.append(cu); mc_.append(cc)
+            # tỉ lệ corpus nằm cùng bucket 16 bit với khoá gốc của query (cùng phía tâm)
+            kq_u = prefix16((qn @ P)[:, :K16] > 0); kq_c = prefix16(((qn - mu_d) @ P)[:, :K16] > 0)
+            uu, cu_ = np.unique(ku, return_counts=True); mu_map = dict(zip(uu.tolist(), cu_.tolist()))
+            uc, cc_ = np.unique(kc, return_counts=True); mc_map = dict(zip(uc.tolist(), cc_.tolist()))
+            qu_.append(float(np.mean([mu_map.get(int(x), 0) for x in kq_u]) / N))
+            qc_.append(float(np.mean([mc_map.get(int(x), 0) for x in kq_c]) / N))
+        ext.update(coll_meas_u=float(np.mean(mu_)), coll_meas_u_tables=mu_, coll_meas_c=float(np.mean(mc_)),
+                   coll_meas_c_tables=mc_, qfrac_meas_u=float(np.mean(qu_)), qfrac_meas_c=float(np.mean(qc_)))
+        log(f"trùng bucket 16 bit giữa hai document: trường trung bình {ext['coll_pred_meanfield']:.2e}, "
+            f"công thức góc {ext['coll_pred_exact_u']:.2e}, đo thật {ext['coll_meas_u']:.2e} "
+            f"(bucket hiệu dụng {1 / ext['coll_pred_meanfield']:,.0f} / {1 / ext['coll_pred_exact_u']:,.0f} / "
+            f"{1 / max(ext['coll_meas_u'], 1e-12):,.0f}); cặp gần trùng (cos > 0,99) {100 * ext['near_dup_frac_u']:.3f}%")
+        log(f"  trừ tâm: công thức góc {ext['coll_pred_exact_c']:.2e}, đo thật {ext['coll_meas_c']:.2e}")
+        log(f"  phần corpus cùng bucket 16 bit với query: dự đoán {100 * ext['qfrac_pred_u']:.3f}%, đo {100 * ext['qfrac_meas_u']:.3f}% "
+            f"(trừ tâm: {100 * ext['qfrac_pred_c']:.4f}% / {100 * ext['qfrac_meas_c']:.4f}%)")
+        fa_ = a.out or f"probeA_{pre}{tag}_s{a.seed}.json"
+        json.dump(dict(argv=vars(a), N=int(N), d=int(d), nS=int(nS), aniso=aniso, ext=ext, numpy=np.__version__),
+                  open(fa_, "w"), indent=1)
+        log(f"\n-> {fa_}   ({time.time() - t0:.0f}s)")
+        return
+
+    if a.space == "m1":
+        cb = pb.pq_train(E[S], d // a.dsub, a.seed)
+        cd = pb.pq_encode(E, cb)
+    else:
+        cb = np.load(f"{D}/{ds}_pq_codebook_m512.npy").astype(np.float32)
+        cd = np.load(f"{D}/{ds}_pq_codes_m512.npy")
 
     # ---------------- điểm ADC của mọi document cho từng query đánh giá (dùng chung cho mọi biến thể)
     qv = l2norm(Qall[ev])
@@ -319,7 +390,6 @@ def main():
         log(f"[{vn}] xong ({time.time() - tv:.0f}s, tổng {time.time() - t0:.0f}s)")
 
     # ---------------- tự kiểm với 04b
-    pre = "" if ds == "code" else f"{ds}_"
     fG = f"probeG_{pre}{a.tag}_s{a.seed}.json"
     if a.space == "m1" and os.path.exists(fG) and 5 in Ls and 8 in Ts:
         G = json.load(open(fG))
