@@ -49,6 +49,17 @@ Bổ sung đợt 7b:
             cách học, tự kiểm index native ở f = 1 (300 query đánh giá, L = 5, T = 8) phải trùng biến thể cùng tên
             trong probeP_<pre><tag>_s<seed>.json của đợt 7 (reach, final, rerank@20, ứng viên, peer).
 
+Bổ sung đợt 8 (hai baseline, mặc định giữ đúng từng số đợt 7b cho các chính sách cũ):
+  full      dựng lại toàn bộ index: mọi object có record E1 thật từ đầu, E0 gỡ hết. Cận trên, tốn 100% ngân sách
+            nhúng lại ngay từ đầu (ghi ở reembed_t0).
+  mapall    map-and-republish kiểu FastFill: ở t = 0 re-indexer công bố cho mọi object ngoài S một record E1 dựng từ
+            vector ánh xạ qua adapter, v = chuẩn hoá(c0 W_f) với c0 là bản tái tạo PQ của record E0, đặt bằng chính
+            placement E1 và mã hoá bằng codebook E1; E0 gỡ hết (ghi republish_t0, không nhúng lại). Client coi record
+            ánh xạ là gần đúng: record ánh xạ nằm trong pool rerank được tải payload, chấm cosine M1 thật, và re-indexer
+            thay bằng record E1 thật (cùng quy tắc với lazy). Mỗi peer trả top-kappa trên cả hai loại record.
+  --check-prev FILE  so mọi run có trong FILE (totals, cửa sổ, snapshot) với run cùng tên ở lượt này, để chắc code mới
+            không đổi kết quả các chính sách cũ.
+
 CHẠY: python3 evo/11_probe_safe.py --tag arctic --dataset code100kfq --seed 3 --nodes 50000 --frac 0.02
 """
 import argparse, importlib.util, json, os, random, time
@@ -101,6 +112,7 @@ def main():
     ap.add_argument("--itq-iters", type=int, default=50)
     ap.add_argument("--check-10", default="auto", help="probeP của đợt 7 để tự kiểm placement học; none = bỏ")
     ap.add_argument("--check-06", default="auto")
+    ap.add_argument("--check-prev", default="none", help="file kết quả cũ của 11 để so từng số các run trùng tên")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     t0 = time.time()
@@ -187,9 +199,28 @@ def main():
     sides_A = [mc.Side2(NA[i], anchors0, a.nodes, fa(i)) for i in range(len(ev))]
     log(f"định tuyến và chấm điểm xong ({time.time() - t0:.0f}s)")
 
+    # ---------------- baseline map-and-republish: record E1 ánh xạ cho mọi object, cùng placement E1
+    pols_req = a.policies.split(",")
+    sides_KM, anchorsM = None, None
+    if "mapall" in pols_req:
+        Mv = l2norm(C0 @ Wf).astype(np.float32)
+        cdM = pb.pq_encode(Mv, cb1)
+        if a.e1_place == "u":
+            anchorsM = pb.build_index(Mv, P1, nid)
+        else:
+            anchorsM = np.stack([pb.nearest_node(p10.pack(p10.doc_bits(Mv, W, t, PV["cd"])), nid)
+                                 for W, t in zip(PV["W"], PV["t"])])
+        anchorsKM = np.concatenate([anchorsK, anchorsM], axis=1)     # id < N: record thật, id >= N: record ánh xạ
+        cdKM = np.concatenate([cd1, cdM], axis=0)
+        sides_KM = [mc.Side2(NK[i], anchorsKM, a.nodes,
+                             (lambda r, i=i: (-mc.adc_l2(q1all[i], cb1, cdKM[r]), mc.adc_ip(q1all[i], cb1, cdKM[r]))))
+                    for i in range(len(ev))]
+        cosm = float(np.mean((l2norm(E1) * Mv).sum(1)))
+        log(f"map-and-republish: cos TB giữa vector ánh xạ và embedding E1 thật = {cosm:.3f} ({time.time() - t0:.0f}s)")
+
     # ---------------- tự kiểm placement học với 10 (index native ở f = 1, như E1ONLY)
     pre = "" if ds == "code" else f"{ds}_"
-    check10 = None
+    check10, nat1 = None, None
     if a.e1_place != "u":
         allon = np.ones(N, dtype=bool)
         acc = dict(reach=[], final=[], rr=[], cand=[], nodes=[])
@@ -295,6 +326,31 @@ def main():
         scan = (n0 if has0 else 0) + (n1 if has1 else 0)   # record còn hoạt động mà các peer được hỏi phải chấm
         return fin, rr, pool[fet], nodes, int(moved), l1f, hints, nbonus, gfr, int(scan)
 
+    def one_query_map(qi, inE1, mapped):
+        """mapall: chỉ còn phía E1 (record thật và record ánh xạ trên cùng placement). Cùng kiểu trả về với one_query."""
+        sKM, gq, q1v = sides_KM[qi], gt5_all[ev[qi]], Q1[ev[qi]]
+        n1, l, y = sKM.ranked(np.concatenate([inE1, mapped]), a.kappa, Rk)
+        l, y = np.asarray(l, dtype=np.int64), np.asarray(y, dtype=np.float64)
+        ism = l >= N
+        lst = np.where(ism, l - N, l)
+        g = set(np.asarray(gq).tolist())
+        fin = len(set(lst[:5].tolist()) & g) / 5.0
+        pool, fet = lst[:Rk], ism[:Rk]
+        sc = y[:Rk].copy()
+        if fet.any():
+            sc[fet] = E1[pool[fet]] @ q1v                # record ánh xạ: tải payload, chấm cosine M1 thật
+        ordr = np.argsort(-sc, kind="stable")
+        top = pool[ordr[:5]]
+        rr = len(set(top.tolist()) & g) / 5.0
+        if gold is not None:
+            gq0 = int(gold[ev[qi]])
+            gfr = (float(gq0 in set(lst[:5].tolist())), float(gq0 in set(top.tolist())))
+        else:
+            gfr = (float("nan"), float("nan"))
+        tK = sKM.touched()
+        moved = np.minimum(load["K"][tK], a.kappa).sum()
+        return (fin, rr, pool[fet], len(tK), int(moved), np.zeros(0, dtype=np.int64), pool[fet], 0, gfr, int(n1))
+
     load = {}
 
     def publish(docs, inE1, act0, retire):
@@ -316,30 +372,48 @@ def main():
     def simulate(stream, policy, bg_rate=0.0, confirm=0):
         inE1 = np.zeros(N, dtype=bool); inE1[S] = True
         act0 = ~inE1
+        mapped = np.zeros(N, dtype=bool)
+        if policy == "full":                             # dựng lại toàn bộ: mọi record E1 thật, E0 gỡ hết
+            inE1[:] = True; act0[:] = False
+        elif policy == "mapall":                         # map-and-republish: record ánh xạ cho mọi object ngoài S
+            mapped = ~inE1; act0[:] = False
         load["0"] = np.bincount(anchors0[:, act0].ravel(), minlength=a.nodes)
         load["K"] = np.bincount(anchorsK[:, inE1].ravel(), minlength=a.nodes)
+        if policy == "mapall":
+            load["K"] = load["K"] + np.bincount(anchorsM[:, mapped].ravel(), minlength=a.nodes)
+
+        def qfun(qi):
+            return one_query_map(qi, inE1, mapped) if policy == "mapall" else one_query(qi, act0, inE1)
         conf = np.zeros(N, dtype=np.int32)
         seen = np.zeros(len(ev), dtype=bool)
         ptr, accb = 0, 0.0
         rec = {k: [] for k in ("final", "rr", "fetch", "new", "nodes", "moved", "f", "rep", "gtE1",
-                               "rep_exact", "qlen", "dual", "act0", "conf", "retired", "bonus", "gf", "gr", "scan")}
+                               "rep_exact", "qlen", "dual", "act0", "conf", "retired", "bonus", "gf", "gr", "scan",
+                               "mapped")}
         snaps = {}
         lazyish = policy in ("lazy", "lazyD") or policy.startswith("lazyV")
         for t in range(len(stream) + 1):
             if t in cps:
-                hs = [one_query(h, act0, inE1) for h in held_q]
+                hs = [qfun(h) for h in held_q]
                 snaps[str(t)] = dict(final=100 * np.mean([h[0] for h in hs]), rr=100 * np.mean([h[1] for h in hs]),
                                      f=float(inE1.mean()), dual=float((inE1 & act0).mean()),
                                      gold_final=100 * float(np.mean([h[8][0] for h in hs])),
                                      gold_rr=100 * float(np.mean([h[8][1] for h in hs])),
-                                     scan=float(np.mean([h[9] for h in hs])))
+                                     scan=float(np.mean([h[9] for h in hs])), mapped=float(mapped.mean()))
             if t == len(stream):
                 break
             qi = int(stream[t])
             gq = gt5_all[ev[qi]]
             gtE1 = float(inE1[np.asarray(gq)].mean())
-            fin, rr, fetched, nodes, moved, l1, hints, nbonus, gfr, scan = one_query(qi, act0, inE1)
+            fin, rr, fetched, nodes, moved, l1, hints, nbonus, gfr, scan = qfun(qi)
             new, nconf, nret = 0, 0, 0
+            if policy == "mapall":                       # re-indexer thay record ánh xạ vừa tải bằng record E1 thật
+                docs = np.asarray([x for x in np.unique(hints) if mapped[x]], dtype=np.int64)
+                if len(docs):
+                    mapped[docs] = False; inE1[docs] = True
+                    np.subtract.at(load["K"], anchorsM[:, docs].ravel(), 1)
+                    np.add.at(load["K"], anchorsK[:, docs].ravel(), 1)
+                new += len(docs)
             if lazyish:
                 if policy.startswith("lazyV"):
                     dl = l1[inE1[l1] & act0[l1]]          # object dual mà native vừa tìm thấy
@@ -361,7 +435,7 @@ def main():
                           ("moved", moved), ("f", float(inE1.mean())), ("rep", bool(seen[qi])), ("gtE1", gtE1),
                           ("rep_exact", bool(seen[qi])), ("qlen", 0), ("dual", float((inE1 & act0).mean())),
                           ("act0", float(act0.mean())), ("conf", nconf), ("retired", nret), ("bonus", nbonus),
-                          ("gf", gfr[0]), ("gr", gfr[1]), ("scan", scan)):
+                          ("gf", gfr[0]), ("gr", gfr[1]), ("scan", scan), ("mapped", float(mapped.mean()))):
                 rec[kk].append(v)
             seen[qi] = True
         return rec, snaps
@@ -401,10 +475,10 @@ def main():
                     act0_end=100 * float(rec["act0"][-1]), conf_total=int(np.sum(rec["conf"])),
                     retired_total=int(np.sum(rec["retired"])), dual_from_e0=float(np.mean(rec["bonus"])),
                     gold_final=100 * float(np.mean(rec["gf"])), gold_rr=100 * float(np.mean(rec["gr"])),
-                    scan=float(np.mean(rec["scan"])))
+                    scan=float(np.mean(rec["scan"])), mapped_end=100 * float(rec["mapped"][-1]))
 
     out = dict(argv=vars(a), N=int(N), n_sample=int(nS), cal=ols_ad, sig1=sig1, runs={}, check_06=None,
-               check_10=check10, numpy=np.__version__, e1_storage=stK)
+               check_10=check10, native_f1=nat1, numpy=np.__version__, e1_storage=stK)
     pols = a.policies.split(",")
     for z in zipfs:
         ranks = np.random.RandomState(a.seed + 43).permutation(len(pool_q))
@@ -439,6 +513,10 @@ def main():
             rec, snaps = simulate(stream, pol_run, rate, confirm=c)
             done[name] = rec
             tt = totals(rec); tt["bg_rate"] = rate
+            if pol == "full":
+                tt["reembed_t0"] = int(N - nS)
+            if pol == "mapall":
+                tt["republish_t0"] = int(N - nS)
             w = windows(rec, a.window)
             out["runs"][f"z{z:g}|PROB|{name}"] = dict(zipf=z, policy=name, totals=tt, windows=w, snapshots=snaps)
             log(f"  {name:7s} final={tt['final']:5.1f} rerank={tt['rr']:5.1f} tải/query={tt['fetch']:4.1f} "
@@ -486,6 +564,37 @@ def main():
             log(f"    lệch: {dd}")
     else:
         log(f">>> bỏ qua tự kiểm với 06 ({f06} không có)")
+
+    # ---------------- tự kiểm với một lượt cũ của chính 11
+    out["check_prev"] = None
+    if a.check_prev != "none":
+        if os.path.exists(a.check_prev):
+            old = json.load(open(a.check_prev))
+            n, bad, diffs = 0, 0, []
+
+            def isbad2(x, y):
+                if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                    return not (abs(x - y) <= 1e-9 or (x != x and y != y))
+                return x != y
+            for k, r in old.get("runs", {}).items():
+                if k not in out["runs"]:
+                    continue
+                nw = out["runs"][k]
+                parts = [("totals", r["totals"], nw["totals"])]
+                parts += [(f"window{wi}", x, y) for wi, (x, y) in enumerate(zip(r["windows"], nw["windows"]))]
+                parts += [(f"snap{t_}", sv, nw["snapshots"].get(t_, {})) for t_, sv in r.get("snapshots", {}).items()]
+                for lab, x, y in parts:
+                    for kk, v in x.items():
+                        if kk in y:
+                            n += 1
+                            if isbad2(v, y[kk]):
+                                bad += 1; diffs.append((k, lab, kk, v, y[kk]))
+            out["check_prev"] = dict(file=a.check_prev, n=n, bad=int(bad), diffs=diffs[:10])
+            log(f">>> so với lượt cũ ({a.check_prev}): {n} giá trị, {'KHỚP' if bad == 0 and n > 0 else f'{bad} LỆCH'}")
+            for dd in diffs[:10]:
+                log(f"    lệch: {dd}")
+        else:
+            log(f">>> không có {a.check_prev} để so với lượt cũ")
 
     fn = a.out or f"probeV_{pre}{a.tag}_s{a.seed}.json"
     json.dump(out, open(fn, "w"), indent=1)
