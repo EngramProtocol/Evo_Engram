@@ -18,6 +18,9 @@ Biến thể placement (mỗi bảng: W_l (d x 63), ngưỡng t_l, tâm của do
   itq_d   ITQ (Gong và Lazebnik) trên 63 thành phần chính, mỗi bảng khởi tạo ngẫu nhiên và hoán vị bit
           riêng, ngưỡng trung vị trên S; query trừ trung bình document.
   itq_q   như itq_d, query trừ trung bình query.
+  itq<k>_q, itq<k>_d (đợt 9, thăm dò điểm nóng của ITQ): ITQ trên k thành phần chính (k >= 63) rồi giữ 63 trong k bit.
+--check-prev FILE (đợt 9): so mọi số của các biến thể có trong cả FILE và lượt này (mọi L, T và tải), để chắc biến thể cũ
+không đổi khi chạy lại cùng seed.
 Ngân sách: L bảng trong --Ls (mặc định 5,10; bảng đầu của L lớn trùng L nhỏ), T probe mỗi bảng trong --Ts
 (khoá gốc + T-1 lần lật một bit biên nhỏ nhất trong cbits bit đầu, như 04b; T <= cbits + 1), K peer XOR-gần
 nhất mỗi khoá, mỗi peer trả top-kappa.
@@ -38,7 +41,7 @@ E1ONLY/E1ONLY_c/E1ONLY_cq ở f = 1 (reach, final, rerank@20, ứng viên, số 
 
 CHẠY: python3 evo/10_probe_placement.py --tag e5large --dataset code100kfq --seed 3 --nodes 50000 --frac 0.02
 """
-import argparse, json, os, random, time
+import argparse, json, os, random, re, time
 import numpy as np
 import me_common as mc
 
@@ -109,11 +112,15 @@ def make_variant(name, Xs, Lmax, seed, P_rand, mu_d, mu_q, k_pca, itq_iters):
         for _ in range(Lmax):
             Ws.append(U @ rand_orth(rng, U.shape[1], 63))
     elif name.startswith("itq"):
-        U = Vt[:63].T.astype(np.float32)                                 # d x 63
+        # itq_d, itq_q: ITQ trên 63 thành phần chính. itq<k>_d, itq<k>_q (đợt 9): ITQ trên k thành phần chính, giữ 63
+        # trong k bit theo hoán vị ngẫu nhiên của bảng. Với k = 63 dãy số ngẫu nhiên dùng y hệt bản cũ.
+        mk = re.match(r"itq(\d+)_", name)
+        kk = 63 if mk is None else max(63, min(int(mk.group(1)), Vt.shape[0]))
+        U = Vt[:kk].T.astype(np.float32)                                 # d x k
         V = Xc @ U
         for _ in range(Lmax):
             R = itq(V, itq_iters, rng)
-            Ws.append((U @ R)[:, rng.permutation(63)])
+            Ws.append((U @ R)[:, rng.permutation(kk)[:63]])
     else:
         raise ValueError(name)
     ts = [np.median(Xc @ W, axis=0).astype(np.float32) for W in Ws]
@@ -171,6 +178,7 @@ def main():
                     help="1: chỉ đo độ dị hướng, xác suất trùng bucket 16 bit dự đoán (trường trung bình và công thức góc "
                          "chính xác) và đo thật, rồi ghi probeA_*.json; không dựng index, không chấm điểm")
     ap.add_argument("--aniso-pairs", type=int, default=200000, help="số cặp document cho công thức góc ở --aniso-only")
+    ap.add_argument("--check-prev", default="none", help="probeP cũ cùng seed để so từng số các biến thể trùng tên")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     t0 = time.time()
@@ -412,6 +420,32 @@ def main():
             log(f">>> không tự kiểm được: tham số của {fG} khác")
     else:
         log(">>> bỏ qua tự kiểm với 04b (không có file hoặc không phải space m1, L=5, T=8)")
+
+    out["check_prev"] = None
+    if a.check_prev != "none":
+        if os.path.exists(a.check_prev):
+            old = json.load(open(a.check_prev))
+            n, bad, diffs = 0, 0, []
+
+            def walk(x, y, path):
+                nonlocal n, bad
+                if isinstance(x, dict):
+                    for kk_, vv in x.items():
+                        if isinstance(y, dict) and kk_ in y:
+                            walk(vv, y[kk_], path + [kk_])
+                elif isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                    n += 1
+                    if not (abs(x - y) <= 1e-9 or (x != x and y != y)):
+                        bad += 1; diffs.append(("/".join(path), x, y))
+            for vn in out["variants"]:
+                if vn in old.get("variants", {}):
+                    walk(old["variants"][vn], out["variants"][vn], [vn])
+            out["check_prev"] = dict(file=a.check_prev, n=n, bad=int(bad), diffs=diffs[:10])
+            log(f">>> so với lượt cũ ({a.check_prev}): {n} giá trị, {'KHỚP' if bad == 0 and n > 0 else f'{bad} LỆCH'}")
+            for dd in diffs[:10]:
+                log(f"    lệch: {dd}")
+        else:
+            log(f">>> không có {a.check_prev} để so với lượt cũ")
 
     fn = a.out or f"probeP_{pre}{tag}_s{a.seed}.json"
     json.dump(out, open(fn, "w"), indent=1)

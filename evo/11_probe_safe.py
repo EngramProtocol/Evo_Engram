@@ -60,6 +60,29 @@ Bổ sung đợt 8 (hai baseline, mặc định giữ đúng từng số đợt 
   --check-prev FILE  so mọi run có trong FILE (totals, cửa sổ, snapshot) với run cùng tên ở lượt này, để chắc code mới
             không đổi kết quả các chính sách cũ.
 
+Bổ sung đợt 9 (mặc định tắt; khi tắt, mọi chính sách cũ giữ đúng từng số đợt 8):
+  mapkeep   như mapall nhưng giữ index E0 tới khi object được thay bằng record E1 thật, nên mỗi truy vấn hỏi cả hai
+            epoch như lazyVbgD. Object đã thấy qua phía E1 (record thật hoặc record ánh xạ) bị bỏ khỏi danh sách E0, và
+            phía E0 đọc tiếp tới đủ R record chỉ có ở E0 (như --dual-slots bonus). Record trong pool không có điểm ADC
+            native được tải payload và chấm cosine M1 thật; re-indexer thay nó bằng record E1 thật và retire bản E0 ngay.
+  churn     theo engine churn của V-Engram (main_churn_engine.py): phiên Weibull (hình dạng --weibull-shape, trung vị
+            --median-session phút), node rời mạng mất mọi record nó giữ, node mới thay chỗ với bộ nhớ rỗng; sửa chữa
+            lười mỗi --repair-every phút ghi lại các bản đã mất của record còn hoạt động và gửi keep-alive cho bản còn
+            sống. Khác engine của V-Engram ở một điểm: node mới giữ đúng vị trí của node cũ trong không gian khoá, nên
+            định tuyến và vị trí đặt record không đổi, churn chỉ tác động qua bản ghi bị mất. Truy vấn hỏi K peer gần
+            nhất của mỗi khoá probe, nên node mới vào gần khoá chỉ đẩy anchor cũ xuống một hạng; phần mất dữ liệu là
+            phần chính. --churn-min: cả dòng truy vấn ứng với bao nhiêu phút (0 = không churn liên tục). Thời gian còn
+            lại của phiên ban đầu lấy từ phân phối dừng (hình dạng 0,5: lambda·U², U ~ Gamma(2, 1)), nên không cần
+            warm-up. Lần sửa thứ j ở phút (j + --repair-phase)·chu kỳ, để snapshot không rơi đúng lúc vừa sửa xong.
+  lỗi peer  --fail-at t --fail-frac f: ngay trước lượt t, một phần f số node hỏng cùng lúc (mất dữ liệu như rời mạng).
+            Lịch churn và lỗi chỉ phụ thuộc seed, nên mọi chính sách trong một job thấy đúng cùng một chuỗi sự kiện.
+            Khi bật churn hoặc lỗi, đo thêm ở mỗi snapshot: phần object còn ít nhất một bản ở E0 (alive0) và ở E1
+            (aliveK), phần corpus mất mọi đường tìm (lost_obj: không còn bản nào ở epoch nào); và trong totals: số bản
+            ghi được sửa và số keep-alive mỗi truy vấn, tổng số lượt node rời mạng.
+  --churn-sets 'tên:khoá=giá trị,...;...' chạy thêm các cấu hình churn trong cùng job sau cấu hình chính, dùng chung
+            phần dựng index và định tuyến (tốn phần lớn thời gian của job); run ghi tên 'z<z>|PROB|<chính sách>|<tên>',
+            chính sách lấy từ --churn-policies, Zipf từ --churn-zipf.
+
 CHẠY: python3 evo/11_probe_safe.py --tag arctic --dataset code100kfq --seed 3 --nodes 50000 --frac 0.02
 """
 import argparse, importlib.util, json, os, random, time
@@ -74,6 +97,120 @@ _sp10.loader.exec_module(p10)
 np.seterr(invalid='ignore', divide='ignore')
 q3, pb = mc.q3, mc.pb
 log, l2norm = mc.log, mc.l2norm
+
+
+# ----------------------------------------------------------------- churn (đợt 9)
+def churn_schedule(a):
+    """-> (deps, reps): deps[t] = các node rời mạng ngay trước lượt t (gồm cả sự cố đồng loạt), reps = các lượt t có
+    sửa chữa ngay trước lượt đó. Chỉ phụ thuộc seed và tham số churn."""
+    deps, reps = {}, set()
+    if a.churn_min > 0:
+        rng = np.random.RandomState(a.seed + 61)
+        k = float(a.weibull_shape)
+        lam = a.median_session / (np.log(2) ** (1.0 / k))
+        dt = a.churn_min * a.churn_step / a.stream
+        if abs(k - 0.5) < 1e-12:
+            rem = lam * rng.gamma(2.0, 1.0, size=a.nodes) ** 2       # thời gian còn lại ở trạng thái dừng
+        else:                                                        # hình dạng khác: warm-up một trung vị phiên
+            rem = lam * rng.weibull(k, size=a.nodes)
+            for _ in range(int(np.ceil(a.median_session / dt))):
+                rem -= dt
+                d_ = np.flatnonzero(rem <= 0)
+                rem[d_] = lam * rng.weibull(k, size=len(d_))
+        for t in range(a.churn_step, a.stream + 1, a.churn_step):
+            rem -= dt
+            dead = np.flatnonzero(rem <= 0)
+            if len(dead):
+                rem[dead] = lam * rng.weibull(k, size=len(dead))     # như V-Engram: phiên mới bắt đầu ở mốc bước
+                deps[t] = dead.astype(np.int64)
+        if a.repair_every > 0:
+            j = 0
+            while True:
+                t = int(round((j + a.repair_phase) * a.repair_every / a.churn_min * a.stream))
+                if t > a.stream:
+                    break
+                reps.add(t); j += 1
+    if a.fail_at >= 0:
+        rs = np.random.RandomState(a.seed + 67)
+        f = rs.choice(a.nodes, size=int(round(a.fail_frac * a.nodes)), replace=False).astype(np.int64)
+        deps[a.fail_at] = np.union1d(deps.get(a.fail_at, np.zeros(0, np.int64)), f)
+    return deps, reps
+
+
+CHURN_KEYS = dict(churn_min=float, median_session=float, weibull_shape=float, repair_every=float, repair_phase=float,
+                  churn_step=int, fail_at=int, fail_frac=float)
+CHURN_DEFAULTS = dict(churn_min=0.0, median_session=120.0, weibull_shape=0.5, repair_every=0.0, repair_phase=0.5,
+                      churn_step=10, fail_at=-1, fail_frac=0.2)
+
+
+def parse_churn_sets(s):
+    """'ch:churn_min=720,median_session=120,repair_every=60;fail:fail_at=1500,fail_frac=0.3' -> [(tên, tham số)].
+    Mỗi cấu hình bắt đầu từ giá trị mặc định của các tham số churn, không kế thừa cấu hình chính."""
+    out = []
+    for part in [x for x in (s or "").split(";") if x.strip()]:
+        name, _, kv = part.partition(":")
+        d = dict(CHURN_DEFAULTS)
+        for item in [y for y in kv.split(",") if y.strip()]:
+            k, _, v = item.partition("=")
+            k = k.strip()
+            if k not in CHURN_KEYS:
+                raise SystemExit(f"--churn-sets: tham số lạ '{k}'")
+            d[k] = CHURN_KEYS[k](v)
+        out.append((name.strip(), d))
+    return out
+
+
+def placement_index(anchors, n_nodes):
+    """CSR: node -> vị trí phẳng trong anchors (L x N) của các bản ghi đặt ở node đó."""
+    flat = anchors.ravel()
+    order = np.argsort(flat, kind="stable")
+    starts = np.searchsorted(flat[order], np.arange(n_nodes + 1))
+    return order, starts
+
+
+def placements_at(idx, nodes, n_cols):
+    order, starts = idx
+    parts = [order[starts[x]:starts[x + 1]] for x in nodes.tolist()]
+    pos = np.concatenate(parts) if parts else np.zeros(0, np.int64)
+    return pos // n_cols, pos % n_cols                                # (bảng, object)
+
+
+def kappa_positions_lost(order, anchors, mask, kappa, need, lost):
+    """Như mc.kappa_positions nhưng một node chỉ tính cho object nếu bản ghi của object ở node đó chưa mất."""
+    if need <= kappa:
+        return np.arange(min(need, len(order)))
+    cnt, out = {}, []
+    for p, doc in enumerate(order.tolist()):
+        ok = False
+        col, lc = anchors[:, doc], lost[:, doc]
+        for n in set(col[~lc].tolist()):
+            if not mask[n]:
+                continue
+            c = cnt.get(n, 0)
+            if c < kappa:
+                ok = True
+            cnt[n] = c + 1
+        if ok:
+            out.append(p)
+            if len(out) >= need:
+                break
+    return np.asarray(out, dtype=np.int64)
+
+
+def ranked_lost(s, active, lost, kappa, need):
+    """Như Side2.ranked (ngân sách đầy đủ) nhưng bỏ bản ghi đã mất: object chỉ reachable nếu còn ít nhất một bản ghi
+    chưa mất ở một node được hỏi. lost None thì gọi đúng Side2.ranked, nên khi tắt churn kết quả không đổi."""
+    if lost is None:
+        return s.ranked(active, kappa, need)
+    touched, mask, _ = s.budget(None)
+    if getattr(s, "_tp", None) is None:
+        s._tp = mask[s.anchors[:, s.reach]]                           # (L, |reach|): bản ghi nằm ở node được hỏi
+    ok = active[s.reach] & (s._tp & ~lost[:, s.reach]).any(0)
+    r, k, x = s.reach[ok], s.key[ok], s.x[ok]
+    o = np.argsort(-k)
+    order = r[o]
+    pos = kappa_positions_lost(order, s.anchors, mask, kappa, need, lost)
+    return len(r), order[pos], x[o][pos]
 
 
 def main():
@@ -113,6 +250,19 @@ def main():
     ap.add_argument("--check-10", default="auto", help="probeP của đợt 7 để tự kiểm placement học; none = bỏ")
     ap.add_argument("--check-06", default="auto")
     ap.add_argument("--check-prev", default="none", help="file kết quả cũ của 11 để so từng số các run trùng tên")
+    ap.add_argument("--churn-min", type=float, default=0.0, help="cả dòng truy vấn ứng với bao nhiêu phút; 0 = không churn")
+    ap.add_argument("--median-session", type=float, default=120.0, help="trung vị phiên (phút), như V-Engram")
+    ap.add_argument("--weibull-shape", type=float, default=0.5)
+    ap.add_argument("--repair-every", type=float, default=0.0, help="chu kỳ sửa chữa (phút); 0 = không sửa")
+    ap.add_argument("--repair-phase", type=float, default=0.5, help="lần sửa thứ j ở phút (j + phase) x chu kỳ")
+    ap.add_argument("--churn-step", type=int, default=10, help="số lượt truy vấn giữa hai bước churn")
+    ap.add_argument("--fail-at", type=int, default=-1, help="lượt truy vấn có sự cố đồng loạt; -1 = không")
+    ap.add_argument("--fail-frac", type=float, default=0.2, help="phần node hỏng trong sự cố đồng loạt")
+    ap.add_argument("--churn-sets", default="",
+                    help="cấu hình churn bổ sung chạy trong cùng job, ví dụ 'ch:churn_min=720,median_session=120,"
+                         "repair_every=60;fail:fail_at=1500,fail_frac=0.3'; tên run thêm '|<tên cấu hình>'")
+    ap.add_argument("--churn-policies", default="", help="chính sách cho --churn-sets (mặc định như --policies)")
+    ap.add_argument("--churn-zipf", default="", help="Zipf cho --churn-sets (mặc định như --zipf)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     t0 = time.time()
@@ -202,7 +352,7 @@ def main():
     # ---------------- baseline map-and-republish: record E1 ánh xạ cho mọi object, cùng placement E1
     pols_req = a.policies.split(",")
     sides_KM, anchorsM = None, None
-    if "mapall" in pols_req:
+    if "mapall" in pols_req or "mapkeep" in pols_req:
         Mv = l2norm(C0 @ Wf).astype(np.float32)
         cdM = pb.pq_encode(Mv, cb1)
         if a.e1_place == "u":
@@ -260,6 +410,35 @@ def main():
     bg_order = perm[nS:]
     Rk = a.R
 
+    # ---------------- churn và lỗi peer (đợt 9): lịch sự kiện dùng chung cho mọi chính sách của một cấu hình
+    LS = dict(L0=None, LK=None, LM=None, LKM=None)               # bản ghi đã mất của run đang chạy, (L, N) mỗi phía
+    IX = {}
+
+    def setup_churn(ac):
+        """-> (churn_on, ev_pos, reps, churn_info) cho các tham số churn trong ac."""
+        on = ac.churn_min > 0 or ac.fail_at >= 0
+        if not on:
+            return False, {}, set(), None
+        if not IX:
+            IX["0"] = placement_index(anchors0, a.nodes)
+            IX["K"] = placement_index(anchorsK, a.nodes)
+            IX["M"] = placement_index(anchorsM, a.nodes) if anchorsM is not None else None
+        deps, rp = churn_schedule(ac)
+        evp = {}
+        for t_, dn in deps.items():
+            evp[t_] = (len(dn), placements_at(IX["0"], dn, N), placements_at(IX["K"], dn, N),
+                       placements_at(IX["M"], dn, N) if IX["M"] is not None else None)
+        ndep = int(sum(len(v) for v in deps.values()))
+        info = dict(churn_min=ac.churn_min, median_session=ac.median_session, weibull_shape=ac.weibull_shape,
+                    repair_every=ac.repair_every, repair_phase=ac.repair_phase, churn_step=ac.churn_step,
+                    fail_at=ac.fail_at, fail_frac=ac.fail_frac, departures=ndep, n_events=len(deps),
+                    repair_ts=sorted(rp), model="vị trí node giữ nguyên, chỉ mất bản ghi")
+        log(f"churn: {ndep} lượt node rời mạng hoặc hỏng ({100 * ndep / a.nodes:.0f}% số node) qua {len(deps)} sự kiện, "
+            f"{len(rp)} lần sửa {sorted(rp)[:8]}{' ...' if len(rp) > 8 else ''}")
+        return True, evp, rp, info
+
+    churn_on, ev_pos, reps, churn_info = setup_churn(a)
+
     def one_query(qi, act0, inE1):
         """-> final, rerank, record được tải payload, nodes, moved, danh sách native, gợi ý (record chỉ có ở E0)."""
         sA, sK, gq, q1v = sides_A[qi], sides_K[qi], gt5_all[ev[qi]], Q1[ev[qi]]
@@ -268,14 +447,14 @@ def main():
         dual_any = bool((act0 & inE1).any())
         if dual_any and a.dual_slots == "bonus":
             # object dual không chiếm chỗ: client đọc tiếp danh sách E0 tới khi đủ Rk record chỉ có ở E0
-            n0, l0, x0 = sA.ranked(act0, a.kappa, a.bonus_mult * Rk)
+            n0, l0, x0 = ranked_lost(sA, act0, LS["L0"], a.kappa, a.bonus_mult * Rk)
             l0, x0 = np.asarray(l0, dtype=np.int64), np.asarray(x0)
             only = ~inE1[l0]
             cut = len(l0) if only.sum() < Rk else int(np.flatnonzero(only)[Rk - 1]) + 1
             l0, x0 = l0[:cut], x0[:cut]
         else:
-            n0, l0, x0 = sA.ranked(act0, a.kappa, Rk)
-        n1, l1, y1 = sK.ranked(inE1, a.kappa, Rk)
+            n0, l0, x0 = ranked_lost(sA, act0, LS["L0"], a.kappa, Rk)
+        n1, l1, y1 = ranked_lost(sK, inE1, LS["LK"], a.kappa, Rk)
         l0, x0 = np.asarray(l0, dtype=np.int64), np.asarray(x0)
         l1f = np.asarray(l1, dtype=np.int64)              # danh sách tìm được qua khoá E1 (dùng để xác nhận)
         ex_all = l0[inE1[l0]] if len(l0) else l0          # object dual nhận từ phía E0 (thêm byte trả về)
@@ -329,7 +508,7 @@ def main():
     def one_query_map(qi, inE1, mapped):
         """mapall: chỉ còn phía E1 (record thật và record ánh xạ trên cùng placement). Cùng kiểu trả về với one_query."""
         sKM, gq, q1v = sides_KM[qi], gt5_all[ev[qi]], Q1[ev[qi]]
-        n1, l, y = sKM.ranked(np.concatenate([inE1, mapped]), a.kappa, Rk)
+        n1, l, y = ranked_lost(sKM, np.concatenate([inE1, mapped]), LS["LKM"], a.kappa, Rk)
         l, y = np.asarray(l, dtype=np.int64), np.asarray(y, dtype=np.float64)
         ism = l >= N
         lst = np.where(ism, l - N, l)
@@ -351,6 +530,49 @@ def main():
         moved = np.minimum(load["K"][tK], a.kappa).sum()
         return (fin, rr, pool[fet], len(tK), int(moved), np.zeros(0, dtype=np.int64), pool[fet], 0, gfr, int(n1))
 
+    def one_query_mapkeep(qi, act0, inE1, mapped):
+        """mapkeep: phía E1 gồm record thật và record ánh xạ (như mapall), phía E0 còn hoạt động tới khi object được
+        thay. Object thấy qua phía E1 bị bỏ khỏi danh sách E0; phía E0 đọc tiếp tới đủ Rk record. Cùng kiểu trả về."""
+        sA, sKM, gq, q1v = sides_A[qi], sides_KM[qi], gt5_all[ev[qi]], Q1[ev[qi]]
+        has0 = bool(act0.any())
+        n1, lv, y1 = ranked_lost(sKM, np.concatenate([inE1, mapped]), LS["LKM"], a.kappa, Rk)
+        lv, y1 = np.asarray(lv, dtype=np.int64), np.asarray(y1, dtype=np.float64)
+        ism = lv >= N
+        l1 = np.where(ism, lv - N, lv)
+        n0, l0, x0 = ranked_lost(sA, act0, LS["L0"], a.kappa, a.bonus_mult * Rk)
+        l0, x0 = np.asarray(l0, dtype=np.int64), np.asarray(x0)
+        if len(l0):
+            keep = ~np.isin(l0, l1)
+            l0, x0 = l0[keep][:Rk], x0[keep][:Rk]
+        share1 = float((inE1 | mapped).mean())
+        lst = mc.fuse("PROB", l0, x0, l1, y1, Rk, 1.0 - share1, share1, cal)
+        g = set(np.asarray(gq).tolist())
+        fin = len(set(lst[:5].tolist()) & g) / 5.0
+        pool = np.asarray(lst[:Rk], dtype=np.int64)
+        natl = l1[~ism]                                  # record E1 thật tìm qua khoá E1: có điểm ADC native
+        nat = np.isin(pool, natl)
+        fet = ~nat
+        sc = np.full(len(pool), -np.inf, dtype=np.float64)
+        if fet.any():
+            sc[fet] = E1[pool[fet]] @ q1v
+        if nat.any():
+            ymap = dict(zip(natl.tolist(), y1[~ism].tolist()))
+            sc[nat] = [ymap[x] for x in pool[nat].tolist()]
+        ordr = np.argsort(-sc, kind="stable")
+        top = pool[ordr[:5]]
+        rr = len(set(top.tolist()) & g) / 5.0
+        if gold is not None:
+            gq0 = int(gold[ev[qi]])
+            gfr = (float(gq0 in set(lst[:5].tolist())), float(gq0 in set(top.tolist())))
+        else:
+            gfr = (float("nan"), float("nan"))
+        tA, tK = sA.touched(), sKM.touched()
+        nodes = (len(tA) if has0 else 0) + len(tK)
+        moved = ((np.minimum(load["0"][tA], a.kappa).sum() if has0 else 0) + np.minimum(load["K"][tK], a.kappa).sum())
+        hints = pool[fet & ~inE1[pool]]
+        scan = (n0 if has0 else 0) + n1
+        return fin, rr, pool[fet], nodes, int(moved), np.zeros(0, dtype=np.int64), hints, 0, gfr, int(scan)
+
     load = {}
 
     def publish(docs, inE1, act0, retire):
@@ -358,6 +580,8 @@ def main():
         if len(docs):
             inE1[docs] = True
             np.add.at(load["K"], anchorsK[:, docs].ravel(), 1)
+            if LS["LK"] is not None:
+                LS["LK"][:, docs] = False                # bản E1 vừa công bố nằm ở node đang sống
             if retire:
                 retire_e0(docs, act0)
         return docs
@@ -377,13 +601,58 @@ def main():
             inE1[:] = True; act0[:] = False
         elif policy == "mapall":                         # map-and-republish: record ánh xạ cho mọi object ngoài S
             mapped = ~inE1; act0[:] = False
+        elif policy == "mapkeep":                        # như mapall nhưng giữ E0 tới khi object được thay
+            mapped = ~inE1
+        maplike = policy in ("mapall", "mapkeep")
         load["0"] = np.bincount(anchors0[:, act0].ravel(), minlength=a.nodes)
         load["K"] = np.bincount(anchorsK[:, inE1].ravel(), minlength=a.nodes)
-        if policy == "mapall":
+        if maplike:
             load["K"] = load["K"] + np.bincount(anchorsM[:, mapped].ravel(), minlength=a.nodes)
+        for k_ in LS:
+            LS[k_] = None
+        if churn_on:                                     # mọi bản ghi còn nguyên lúc t = 0
+            LS["L0"] = np.zeros((a.tables, N), dtype=bool)
+            if maplike:
+                LS["LKM"] = np.zeros((a.tables, 2 * N), dtype=bool)
+                LS["LK"], LS["LM"] = LS["LKM"][:, :N], LS["LKM"][:, N:]
+            else:
+                LS["LK"] = np.zeros((a.tables, N), dtype=bool)
+        cst = dict(repair_w=0, keepalive=0, dep=0, lost_max=0.0)
 
         def qfun(qi):
-            return one_query_map(qi, inE1, mapped) if policy == "mapall" else one_query(qi, act0, inE1)
+            if policy == "mapall":
+                return one_query_map(qi, inE1, mapped)
+            if policy == "mapkeep":
+                return one_query_mapkeep(qi, act0, inE1, mapped)
+            return one_query(qi, act0, inE1)
+
+        def churn_tick(t):
+            """Sự kiện churn trước lượt t: node rời mạng hoặc hỏng mất bản ghi, rồi sửa chữa nếu tới chu kỳ."""
+            e = ev_pos.get(t)
+            if e is not None:
+                cst["dep"] += e[0]
+                (t0_, d0_), (tK_, dK_) = e[1], e[2]
+                LS["L0"][t0_, d0_] = True
+                LS["LK"][tK_, dK_] = True
+                if LS["LM"] is not None and e[3] is not None:
+                    LS["LM"][e[3][0], e[3][1]] = True
+            if t in reps:
+                for lost, actv in ((LS["L0"], act0), (LS["LK"], inE1), (LS["LM"], mapped)):
+                    if lost is None or not actv.any():
+                        continue
+                    sub = lost[:, actv]
+                    nl = int(sub.sum())
+                    cst["repair_w"] += nl; cst["keepalive"] += int(sub.size) - nl
+                    lost[:, actv] = False
+
+        def churn_snap():
+            p0 = act0 & (~LS["L0"]).any(0)
+            pK = inE1 & (~LS["LK"]).any(0)
+            pM = (mapped & (~LS["LM"]).any(0)) if LS["LM"] is not None else np.zeros(N, dtype=bool)
+            lo = 100 * float((~(p0 | pK | pM)).mean())
+            cst["lost_max"] = max(cst["lost_max"], lo)
+            return dict(alive0=100 * float(p0.sum()) / max(1, int(act0.sum())),
+                        aliveK=100 * float(pK.sum()) / max(1, int(inE1.sum())), lost_obj=lo)
         conf = np.zeros(N, dtype=np.int32)
         seen = np.zeros(len(ev), dtype=bool)
         ptr, accb = 0, 0.0
@@ -393,6 +662,8 @@ def main():
         snaps = {}
         lazyish = policy in ("lazy", "lazyD") or policy.startswith("lazyV")
         for t in range(len(stream) + 1):
+            if churn_on:
+                churn_tick(t)
             if t in cps:
                 hs = [qfun(h) for h in held_q]
                 snaps[str(t)] = dict(final=100 * np.mean([h[0] for h in hs]), rr=100 * np.mean([h[1] for h in hs]),
@@ -400,6 +671,8 @@ def main():
                                      gold_final=100 * float(np.mean([h[8][0] for h in hs])),
                                      gold_rr=100 * float(np.mean([h[8][1] for h in hs])),
                                      scan=float(np.mean([h[9] for h in hs])), mapped=float(mapped.mean()))
+                if churn_on:
+                    snaps[str(t)].update(churn_snap())
             if t == len(stream):
                 break
             qi = int(stream[t])
@@ -407,12 +680,16 @@ def main():
             gtE1 = float(inE1[np.asarray(gq)].mean())
             fin, rr, fetched, nodes, moved, l1, hints, nbonus, gfr, scan = qfun(qi)
             new, nconf, nret = 0, 0, 0
-            if policy == "mapall":                       # re-indexer thay record ánh xạ vừa tải bằng record E1 thật
+            if maplike:                                  # re-indexer thay record ánh xạ vừa tải bằng record E1 thật
                 docs = np.asarray([x for x in np.unique(hints) if mapped[x]], dtype=np.int64)
                 if len(docs):
                     mapped[docs] = False; inE1[docs] = True
                     np.subtract.at(load["K"], anchorsM[:, docs].ravel(), 1)
                     np.add.at(load["K"], anchorsK[:, docs].ravel(), 1)
+                    if LS["LK"] is not None:
+                        LS["LK"][:, docs] = False
+                    if policy == "mapkeep":              # bản E0 retire khi đã có record E1 thật
+                        retire_e0(docs, act0)
                 new += len(docs)
             if lazyish:
                 if policy.startswith("lazyV"):
@@ -438,6 +715,11 @@ def main():
                           ("gf", gfr[0]), ("gr", gfr[1]), ("scan", scan), ("mapped", float(mapped.mean()))):
                 rec[kk].append(v)
             seen[qi] = True
+        if churn_on:
+            ns = max(1, len(stream))
+            rec["_churn"] = dict(repair_w=cst["repair_w"] / ns, keepalive=cst["keepalive"] / ns, departures=cst["dep"],
+                                 lost_obj_end=snaps[str(max(int(k) for k in snaps))].get("lost_obj", float("nan")),
+                                 lost_obj_max=cst["lost_max"])
         return rec, snaps
 
     def windows(rec, W):
@@ -479,52 +761,77 @@ def main():
 
     out = dict(argv=vars(a), N=int(N), n_sample=int(nS), cal=ols_ad, sig1=sig1, runs={}, check_06=None,
                check_10=check10, native_f1=nat1, numpy=np.__version__, e1_storage=stK)
-    pols = a.policies.split(",")
-    for z in zipfs:
-        ranks = np.random.RandomState(a.seed + 43).permutation(len(pool_q))
-        p = 1.0 / (ranks + 1.0) ** z
-        p /= p.sum()
-        stream = pool_q[np.random.RandomState(a.seed + 47 + int(1000 * z)).choice(len(pool_q), size=a.stream, p=p)]
-        log(f"\n=== Zipf s = {z:g}")
-        done = {}
-        plan = []
-        for pol in pols:
-            if pol == "lazyV":
-                plan += [(f"lazyV{c}", "lazyV", c, None) for c in confirms]
-            elif pol == "bgV":
-                plan += [(f"bgV{c}", "bgV", 0, f"lazyV{c}") for c in confirms]
-            elif pol == "bg":
-                plan.append(("bg", "bg", 0, "lazy"))
-            elif pol in ("lazyVbg", "lazyVbgD"):
-                plan.append((pol, pol, confirms[0], ("lazy", f"lazyV{confirms[0]}")))
-            else:
-                plan.append((pol, pol, 0, None))
-        for name, pol, c, need in plan:
-            rate = 0.0
-            if isinstance(need, tuple):                   # lazyVbg: bù cho đủ số record lazy công bố
-                if any(x not in done for x in need):
-                    log(f"  ({name} cần {need}) bỏ qua"); continue
-                rate = max(0.0, (done[need[0]]["f"][-1] - done[need[1]]["f"][-1]) * N / a.stream)
-            elif need is not None:
-                if need not in done:
-                    log(f"  ({name} cần {need}) bỏ qua"); continue
-                rate = (done[need]["f"][-1] * N - nS) / a.stream
-            pol_run = f"lazyV{c}" if pol == "lazyV" else pol
-            rec, snaps = simulate(stream, pol_run, rate, confirm=c)
-            done[name] = rec
-            tt = totals(rec); tt["bg_rate"] = rate
-            if pol == "full":
-                tt["reembed_t0"] = int(N - nS)
-            if pol == "mapall":
-                tt["republish_t0"] = int(N - nS)
-            w = windows(rec, a.window)
-            out["runs"][f"z{z:g}|PROB|{name}"] = dict(zipf=z, policy=name, totals=tt, windows=w, snapshots=snaps)
-            log(f"  {name:7s} final={tt['final']:5.1f} rerank={tt['rr']:5.1f} tải/query={tt['fetch']:4.1f} "
-                f"record mới/query={tt['new']:4.2f} f cuối={100 * tt['f_end']:4.1f}% dual cuối={tt['dual_end']:4.1f}% "
-                f"(TB {tt['dual_mean']:4.1f}%) E0 còn={tt['act0_end']:4.1f}% xác nhận={tt['conf_total']} "
-                f"retire={tt['retired_total']} dual từ E0/query={tt['dual_from_e0']:4.1f} chấm/query={tt['scan']:7.0f}  "
-                f"[{time.time() - t0:.0f}s]")
-            log("     giữ riêng " + " ".join(f"t{k2}:{v['final']:4.1f}/{v['rr']:4.1f}" for k2, v in snaps.items()))
+    if churn_on:
+        out["churn"] = churn_info
+    def run_set(zl, pols, suffix):
+        """Chạy mọi chính sách trong pols cho từng Zipf trong zl với trạng thái churn hiện tại; tên run thêm suffix."""
+        for z in zl:
+            ranks = np.random.RandomState(a.seed + 43).permutation(len(pool_q))
+            p = 1.0 / (ranks + 1.0) ** z
+            p /= p.sum()
+            stream = pool_q[np.random.RandomState(a.seed + 47 + int(1000 * z)).choice(len(pool_q), size=a.stream, p=p)]
+            log(f"\n=== Zipf s = {z:g}" + (f"   [cấu hình churn {suffix[1:]}]" if suffix else ""))
+            done = {}
+            plan = []
+            for pol in pols:
+                if pol == "lazyV":
+                    plan += [(f"lazyV{c}", "lazyV", c, None) for c in confirms]
+                elif pol == "bgV":
+                    plan += [(f"bgV{c}", "bgV", 0, f"lazyV{c}") for c in confirms]
+                elif pol == "bg":
+                    plan.append(("bg", "bg", 0, "lazy"))
+                elif pol in ("lazyVbg", "lazyVbgD"):
+                    plan.append((pol, pol, confirms[0], ("lazy", f"lazyV{confirms[0]}")))
+                else:
+                    plan.append((pol, pol, 0, None))
+            for name, pol, c, need in plan:
+                rate = 0.0
+                if isinstance(need, tuple):                   # lazyVbg: bù cho đủ số record lazy công bố
+                    if any(x not in done for x in need):
+                        log(f"  ({name} cần {need}) bỏ qua"); continue
+                    rate = max(0.0, (done[need[0]]["f"][-1] - done[need[1]]["f"][-1]) * N / a.stream)
+                elif need is not None:
+                    if need not in done:
+                        log(f"  ({name} cần {need}) bỏ qua"); continue
+                    rate = (done[need]["f"][-1] * N - nS) / a.stream
+                pol_run = f"lazyV{c}" if pol == "lazyV" else pol
+                rec, snaps = simulate(stream, pol_run, rate, confirm=c)
+                done[name] = rec
+                tt = totals(rec); tt["bg_rate"] = rate
+                if pol == "full":
+                    tt["reembed_t0"] = int(N - nS)
+                if pol in ("mapall", "mapkeep"):
+                    tt["republish_t0"] = int(N - nS)
+                if "_churn" in rec:
+                    tt.update(rec["_churn"])
+                w = windows(rec, a.window)
+                out["runs"][f"z{z:g}|PROB|{name}{suffix}"] = dict(zipf=z, policy=name, totals=tt, windows=w,
+                                                                  snapshots=snaps)
+                log(f"  {name:7s} final={tt['final']:5.1f} rerank={tt['rr']:5.1f} tải/query={tt['fetch']:4.1f} "
+                    f"record mới/query={tt['new']:4.2f} f cuối={100 * tt['f_end']:4.1f}% dual cuối={tt['dual_end']:4.1f}% "
+                    f"(TB {tt['dual_mean']:4.1f}%) E0 còn={tt['act0_end']:4.1f}% xác nhận={tt['conf_total']} "
+                    f"retire={tt['retired_total']} dual từ E0/query={tt['dual_from_e0']:4.1f} chấm/query={tt['scan']:7.0f}  "
+                    f"[{time.time() - t0:.0f}s]")
+                log("     giữ riêng " + " ".join(f"t{k2}:{v['final']:4.1f}/{v['rr']:4.1f}" for k2, v in snaps.items()))
+                if "_churn" in rec:
+                    c_ = rec["_churn"]
+                    log(f"     churn: ghi sửa {c_['repair_w']:.1f}/query, keep-alive {c_['keepalive']:.0f}/query, "
+                        f"mất mọi đường cuối dòng {c_['lost_obj_end']:.2f}% (lớn nhất {c_['lost_obj_max']:.2f}%), "
+                        "E0 còn bản " + " ".join(f"t{k2}:{v['alive0']:.1f}" for k2, v in snaps.items()))
+
+    run_set(zipfs, a.policies.split(","), "")
+    # cấu hình churn bổ sung trong cùng job (đợt 9): dùng chung phần dựng index và định tuyến ở trên
+    csets = parse_churn_sets(a.churn_sets)
+    if csets:
+        out["churn_sets"] = {}
+        cpols = (a.churn_policies or a.policies).split(",")
+        czipf = [float(z) for z in (a.churn_zipf or a.zipf).split(",")]
+        for cname, cd in csets:
+            ac = argparse.Namespace(**{**vars(a), **cd})
+            churn_on, ev_pos, reps, info_c = setup_churn(ac)
+            out["churn_sets"][cname] = info_c
+            run_set(czipf, cpols, "|" + cname)
+        churn_on, ev_pos, reps, _ = setup_churn(a)
 
     # ---------------- tự kiểm với 06
     f06 = (f"probeL_{pre}{a.tag}_s{a.seed}_ku.json" if a.check_06 == "auto" else a.check_06)
