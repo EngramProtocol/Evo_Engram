@@ -83,9 +83,27 @@ Bổ sung đợt 9 (mặc định tắt; khi tắt, mọi chính sách cũ giữ
             phần dựng index và định tuyến (tốn phần lớn thời gian của job); run ghi tên 'z<z>|PROB|<chính sách>|<tên>',
             chính sách lấy từ --churn-policies, Zipf từ --churn-zipf.
 
+Bổ sung đợt 10 (mặc định tắt; khi tắt, mọi chính sách cũ giữ đúng từng số đợt 9):
+  --e1-cap m  placement E1 có giới hạn tải, đúng hàm cap_place của 10_probe_placement.py (biến thể '<e1-place>+cap<m>'):
+            mỗi peer nhận tối đa ceil(m · N / số node) record mỗi bảng, record tràn sang peer còn chỗ trong K peer
+            XOR-gần khoá nhất. Vị trí tính một lần cho mọi object theo thứ tự đến cố định của seed (như khi mọi object
+            đã công bố). Tự kiểm index native ở f = 1 so với biến thể cùng tên trong probeP của 10.
+  --bg-finish T1,T2,...  migrate tới khi xong. Với mỗi T, các chính sách có migrate nền chạy lại với hậu tố '|T<T>' trong
+            tên run: nền đi lần lượt qua bg_order và công bố thêm đúng floor((t + 1)(N − |S|) / T) − floor(t (N − |S|) / T)
+            object chưa có bản E1 ở lượt t, nên một mình nền xong trước lượt T; object do truy vấn kéo về làm xong sớm
+            hơn. Khi mọi object đã có bản E1, index E0 bị gỡ toàn bộ (kể cả bản E0 của object dual chưa được xác nhận) và
+            ghi t_done. Chính sách không có nền (static, lazy, full, ...) chạy một lần, không hậu tố.
+  lazybg    lazy cộng migrate nền, cả hai retire bản E0 ngay.
+  rebuild   dựng lại ở nền: truy vấn vẫn dùng index cũ (như static) trong khi nền nhúng lại theo cùng lịch; khi nền
+            xong thì chuyển hẳn sang index mới như full. Trong lúc dựng, bản E1 đã dựng nằm ở peer nhưng chưa phục vụ.
+  lazyVbgDc<p>  lazyVbgD cộng trần p% corpus cho số object dual: vượt trần thì retire bản E0 của object dual cũ nhất (theo
+            thứ tự trở thành dual) dù chưa được xác nhận.
+  Đo thêm mỗi lượt: lưu trữ = (record E0 còn hoạt động + record E1, kể cả bản đang dựng của rebuild) / N; totals ghi
+  store_peak, store_mean, dual_peak, t_done (lượt mà sau đó mọi object đã có bản E1; −1 nếu chưa xong).
+
 CHẠY: python3 evo/11_probe_safe.py --tag arctic --dataset code100kfq --seed 3 --nodes 50000 --frac 0.02
 """
-import argparse, importlib.util, json, os, random, time
+import argparse, importlib.util, json, os, random, re, time
 import numpy as np
 import me_common as mc
 
@@ -213,6 +231,14 @@ def ranked_lost(s, active, lost, kappa, need):
     return len(r), order[pos], x[o][pos]
 
 
+DCAP_RE = re.compile(r"^lazyVbgDc(\d+(?:\.\d+)?)$")
+
+
+def is_bg_policy(p):
+    """Chính sách có migrate nền (đợt 10 thêm lazybg, rebuild, lazyVbgDc<p>)."""
+    return p in ("bg", "bgV", "lazyVbg", "lazybg", "rebuild") or p.startswith("lazyVbgD")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True)
@@ -263,6 +289,8 @@ def main():
                          "repair_every=60;fail:fail_at=1500,fail_frac=0.3'; tên run thêm '|<tên cấu hình>'")
     ap.add_argument("--churn-policies", default="", help="chính sách cho --churn-sets (mặc định như --policies)")
     ap.add_argument("--churn-zipf", default="", help="Zipf cho --churn-sets (mặc định như --zipf)")
+    ap.add_argument("--e1-cap", type=float, default=0.0, help="giới hạn tải của placement E1 (lần mức trung bình); 0 = tắt")
+    ap.add_argument("--bg-finish", default="", help="migrate tới khi xong: danh sách T, nền một mình xong trước lượt T")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     t0 = time.time()
@@ -271,6 +299,15 @@ def main():
     zipfs = [float(z) for z in a.zipf.split(",")]
     confirms = [int(c) for c in a.confirms.split(",") if c]
     cps = sorted({int(c) for c in a.checkpoints.split(",") if int(c) <= a.stream} | {0, a.stream})
+    e1cap_info = None
+    if a.e1_cap > 0:
+        if a.e1_place == "u":
+            raise SystemExit("--e1-cap cần placement học (--e1-place khác u)")
+        if {"mapall", "mapkeep"} & set((a.policies + "," + a.churn_policies).split(",")):
+            raise SystemExit("--e1-cap chưa hỗ trợ mapall, mapkeep")
+    capname = str(int(a.e1_cap)) if float(a.e1_cap).is_integer() else f"{a.e1_cap:g}"
+    e1_name = a.e1_place + (f"+cap{capname}" if a.e1_cap > 0 else "")
+    finishes = [int(x) for x in a.bg_finish.split(",") if x.strip()]
 
     E0 = np.load(f"{D}/{ds}_corpus_embeddings.npy").astype(np.float32)
     cb0 = np.load(f"{D}/{ds}_pq_codebook_m512.npy").astype(np.float32)
@@ -298,7 +335,7 @@ def main():
     S = perm[:nS]
     log("=" * 78)
     log(f"[11] dataset={ds} tag={a.tag} seed={a.seed} N={N} S={nS} dòng={a.stream} zipf={zipfs} R={a.R} "
-        f"chính sách={a.policies} xác nhận={confirms} đặt E1={a.e1_place}  (numpy {np.__version__})")
+        f"chính sách={a.policies} xác nhận={confirms} đặt E1={e1_name}  (numpy {np.__version__})")
 
     # ---------------- adapter, PQ E1, chỉ mục: đúng như 06 với khoá E1 'u'
     m0 = cb0.shape[0]
@@ -319,12 +356,23 @@ def main():
         mu_d = E1[S].mean(0).astype(np.float32)
         mu_q = Q1[trq].mean(0).astype(np.float32) if len(trq) else mu_d
         PV = p10.make_variant(a.e1_place, E1[S], a.tables, a.seed, P1, mu_d, mu_q, a.k_pca, a.itq_iters)
-        anchorsK = np.stack([pb.nearest_node(p10.pack(p10.doc_bits(E1, W, t, PV["cd"])), nid)
-                             for W, t in zip(PV["W"], PV["t"])])
+        dkK = [p10.pack(p10.doc_bits(E1, W, t, PV["cd"])) for W, t in zip(PV["W"], PV["t"])]
+        anchorsK = np.stack([pb.nearest_node(k_, nid) for k_ in dkK])
+        if a.e1_cap > 0:                                 # giới hạn tải (đợt 10), đúng hàm của 10
+            capK = p10.cap_value(a.e1_cap, N, a.nodes)
+            rankK = p10.arrival_rank(a.seed, N)
+            cols, movedK = [], []
+            for l_ in range(a.tables):
+                na_, mv_ = p10.cap_place(dkK[l_], anchorsK[l_], nid, a.k_query, capK, rankK)
+                cols.append(na_); movedK.append(mv_)
+            anchorsK = np.stack(cols)
+            e1cap_info = dict(mult=a.e1_cap, cap=capK, K=a.k_query, moved=movedK)
+            log(f"placement E1 có giới hạn tải: tối đa {capK} record mỗi peer mỗi bảng, dời {sum(movedK)} record "
+                f"(theo bảng {movedK})")
         keys = np.stack(p10.probe_keys(q1all, PV["W"], PV["t"], PV["cq"], T, a.cbits), axis=1)
         NK = pb.knn_nodes(keys.reshape(-1), nid, a.k_query).reshape(len(ev), a.tables, T, a.k_query)
     stK = mc.load_stats(anchorsK, a.nodes)
-    log(f"tải lưu trữ E1 ({a.e1_place}, khi mọi record ở E1): max={stK['max']} rỗng={100 * stK['empty_frac']:.0f}% "
+    log(f"tải lưu trữ E1 ({e1_name}, khi mọi record ở E1): max={stK['max']} rỗng={100 * stK['empty_frac']:.0f}% "
         f"top1%={100 * stK['top1pct_share']:.1f}%")
     Xcf, _ = mc.crossfit_adapter_x(E0, E1, C0, cb0, cd0, Q1[trq], S, S, a.folds, a.seed)
     Ycf = mc.e1_scores(Q1[trq], cb1, cd1, S)
@@ -384,7 +432,7 @@ def main():
         nat1 = dict(reach_r5=100 * float(np.mean(acc["reach"])), final_r5=100 * float(np.mean(acc["final"])),
                     rr20=100 * float(np.mean(acc["rr"])), cand=float(np.mean(acc["cand"])),
                     nodes=float(np.mean(acc["nodes"])))
-        log(f"index native {a.e1_place} ở f = 1: reach={nat1['reach_r5']:.1f} final={nat1['final_r5']:.1f} "
+        log(f"index native {e1_name} ở f = 1: reach={nat1['reach_r5']:.1f} final={nat1['final_r5']:.1f} "
             f"rr20={nat1['rr20']:.1f} ứng viên={nat1['cand']:.0f} peer={nat1['nodes']:.0f}")
         f10 = f"probeP_{pre}{a.tag}_s{a.seed}.json" if a.check_10 == "auto" else a.check_10
         if f10 != "none" and os.path.exists(f10):
@@ -392,11 +440,11 @@ def main():
             same = all(P["argv"].get(k) == v for k, v in (("nodes", a.nodes), ("nq", a.nq), ("frac", a.frac),
                                                           ("k_query", a.k_query), ("kappa", a.kappa), ("cbits", a.cbits),
                                                           ("dsub", a.dsub), ("k_pca", a.k_pca), ("itq_iters", a.itq_iters)))
-            r10 = P["variants"].get(a.e1_place, {}).get("results", {}).get(str(a.tables), {}).get(str(T))
+            r10 = P["variants"].get(e1_name, {}).get("results", {}).get(str(a.tables), {}).get(str(T))
             if same and r10 is not None:
                 bad10 = [(k, r10[k], nat1[k]) for k in nat1 if abs(r10[k] - nat1[k]) > 1e-9]
                 check10 = dict(file=f10, n=len(nat1), bad=len(bad10), diffs=bad10)
-                log(f">>> placement {a.e1_place} so với 10 ({f10}, L={a.tables}, T={T}): {len(nat1)} giá trị, "
+                log(f">>> placement {e1_name} so với 10 ({f10}, L={a.tables}, T={T}): {len(nat1)} giá trị, "
                     f"{'KHỚP' if not bad10 else f'{len(bad10)} LỆCH {bad10}'}")
             else:
                 log(f">>> không tự kiểm được placement với {f10} (tham số khác hoặc thiếu biến thể)")
@@ -593,7 +641,7 @@ def main():
             np.subtract.at(load["0"], anchors0[:, docs].ravel(), 1)
         return docs
 
-    def simulate(stream, policy, bg_rate=0.0, confirm=0):
+    def simulate(stream, policy, bg_rate=0.0, confirm=0, finish=0):
         inE1 = np.zeros(N, dtype=bool); inE1[S] = True
         act0 = ~inE1
         mapped = np.zeros(N, dtype=bool)
@@ -658,9 +706,22 @@ def main():
         ptr, accb = 0, 0.0
         rec = {k: [] for k in ("final", "rr", "fetch", "new", "nodes", "moved", "f", "rep", "gtE1",
                                "rep_exact", "qlen", "dual", "act0", "conf", "retired", "bonus", "gf", "gr", "scan",
-                               "mapped")}
+                               "mapped", "store")}
         snaps = {}
-        lazyish = policy in ("lazy", "lazyD") or policy.startswith("lazyV")
+        lazyish = policy in ("lazy", "lazyD", "lazybg") or policy.startswith("lazyV")
+        # đợt 10: migrate tới khi xong, trần dual, dựng lại ở nền
+        dual_bg = policy.startswith("lazyVbgD")         # nền công bố dạng dual
+        has_bg = is_bg_policy(policy)
+        mcap = DCAP_RE.match(policy)
+        dcap = float(mcap.group(1)) / 100.0 if mcap else None
+        fifo, fptr = [], 0                               # thứ tự object trở thành dual (cho trần dual)
+        hidden = 0                                       # rebuild: số bản E1 đã dựng ở nền, chưa phục vụ
+        nbS = N - nS
+        mig = dict(t_done=(0 if inE1.all() else -1), cap_retired=0, e0_dropped=0)
+
+        def store_now():
+            return float(int(act0.sum()) + int(inE1.sum()) + int(mapped.sum()) + hidden) / N
+        pk = dict(dual=float((inE1 & act0).mean()), store=store_now())   # đỉnh, đo cả ngay trước khi gỡ E0 hay chuyển index
         for t in range(len(stream) + 1):
             if churn_on:
                 churn_tick(t)
@@ -670,7 +731,8 @@ def main():
                                      f=float(inE1.mean()), dual=float((inE1 & act0).mean()),
                                      gold_final=100 * float(np.mean([h[8][0] for h in hs])),
                                      gold_rr=100 * float(np.mean([h[8][1] for h in hs])),
-                                     scan=float(np.mean([h[9] for h in hs])), mapped=float(mapped.mean()))
+                                     scan=float(np.mean([h[9] for h in hs])), mapped=float(mapped.mean()),
+                                     store=store_now())
                 if churn_on:
                     snaps[str(t)].update(churn_snap())
             if t == len(stream):
@@ -697,24 +759,60 @@ def main():
                     if len(dl):
                         conf[dl] += 1; nconf = len(dl)
                         nret = len(retire_e0(dl[conf[dl] >= confirm], act0))
-                mg = publish(hints if policy != "lazy" else fetched, inE1, act0, retire=(policy == "lazy"))
+                retq = policy in ("lazy", "lazybg")      # lazy, lazybg: retire bản E0 ngay
+                mg = publish(fetched if retq else hints, inE1, act0, retire=retq)
                 new += len(mg)
-            if policy in ("bg", "bgV", "lazyVbg", "lazyVbgD"):
-                accb += bg_rate
-                k = int(accb); accb -= k
-                take = []
-                while len(take) < k and ptr < len(bg_order):
-                    x = int(bg_order[ptr]); ptr += 1
-                    if not inE1[x]:
-                        take.append(x)
-                new += len(publish(take, inE1, act0, retire=(policy != "lazyVbgD")))
+                if dcap is not None:
+                    fifo.extend(mg.tolist())
+            if has_bg:
+                if finish:                               # lịch nguyên: một mình nền xong trước lượt finish
+                    k = ((t + 1) * nbS) // finish - (t * nbS) // finish if t < finish else 0
+                else:
+                    accb += bg_rate
+                    k = int(accb); accb -= k
+                if policy == "rebuild":                  # dựng ở nền, chưa phục vụ
+                    hidden = min(nbS, hidden + k)
+                else:
+                    take = []
+                    while len(take) < k and ptr < len(bg_order):
+                        x = int(bg_order[ptr]); ptr += 1
+                        if not inE1[x]:
+                            take.append(x)
+                    pg = publish(take, inE1, act0, retire=not dual_bg)
+                    new += len(pg)
+                    if dcap is not None:
+                        fifo.extend(pg.tolist())
+            if dcap is not None:                         # trần dual: retire bản E0 của object dual cũ nhất
+                excess = int((inE1 & act0).sum()) - int(dcap * N)
+                batch = []
+                while excess > 0 and fptr < len(fifo):
+                    x = fifo[fptr]; fptr += 1
+                    if inE1[x] and act0[x]:
+                        batch.append(x); excess -= 1
+                if batch:
+                    mig["cap_retired"] += len(retire_e0(np.asarray(batch, dtype=np.int64), act0))
+            pk["dual"] = max(pk["dual"], float((inE1 & act0).mean()))
+            pk["store"] = max(pk["store"], store_now())
+            if policy == "rebuild" and hidden >= nbS and not inE1.all():   # dựng xong: chuyển hẳn sang index mới
+                inE1[:] = True; act0[:] = False; hidden = 0
+                load["0"] = np.zeros(a.nodes, dtype=np.int64)
+                load["K"] = np.bincount(anchorsK.ravel(), minlength=a.nodes)
+                if LS["LK"] is not None:
+                    LS["LK"][:] = False
+            if mig["t_done"] < 0 and inE1.all():
+                mig["t_done"] = t + 1
+                if finish and act0.any():                # xong: gỡ toàn bộ index E0
+                    mig["e0_dropped"] += len(retire_e0(np.flatnonzero(act0), act0))
             for kk, v in (("final", fin), ("rr", rr), ("fetch", len(fetched)), ("new", new), ("nodes", nodes),
                           ("moved", moved), ("f", float(inE1.mean())), ("rep", bool(seen[qi])), ("gtE1", gtE1),
                           ("rep_exact", bool(seen[qi])), ("qlen", 0), ("dual", float((inE1 & act0).mean())),
                           ("act0", float(act0.mean())), ("conf", nconf), ("retired", nret), ("bonus", nbonus),
-                          ("gf", gfr[0]), ("gr", gfr[1]), ("scan", scan), ("mapped", float(mapped.mean()))):
+                          ("gf", gfr[0]), ("gr", gfr[1]), ("scan", scan), ("mapped", float(mapped.mean())),
+                          ("store", store_now())):
                 rec[kk].append(v)
             seen[qi] = True
+        rec["_mig"] = dict(mig, store_peak=100 * pk["store"], dual_peak=100 * pk["dual"],
+                           store_mean=100 * float(np.mean(rec["store"])) if rec["store"] else float("nan"))
         if churn_on:
             ns = max(1, len(stream))
             rec["_churn"] = dict(repair_w=cst["repair_w"] / ns, keepalive=cst["keepalive"] / ns, departures=cst["dep"],
@@ -738,7 +836,7 @@ def main():
                             n_rep=int(rep.sum()), fetch=float(np.mean(rec["fetch"][sl])),
                             new=float(np.mean(rec["new"][sl])), nodes=float(np.mean(rec["nodes"][sl])),
                             moved=float(np.mean(rec["moved"][sl])), gtE1=100 * float(np.mean(rec["gtE1"][sl])),
-                            dual=100 * float(rec["dual"][e - 1])))
+                            dual=100 * float(rec["dual"][e - 1]), store=100 * float(rec["store"][e - 1])))
         return out
 
     def totals(rec):
@@ -761,26 +859,34 @@ def main():
 
     out = dict(argv=vars(a), N=int(N), n_sample=int(nS), cal=ols_ad, sig1=sig1, runs={}, check_06=None,
                check_10=check10, native_f1=nat1, numpy=np.__version__, e1_storage=stK)
+    if e1cap_info is not None:
+        out["e1_cap"] = e1cap_info
     if churn_on:
         out["churn"] = churn_info
-    def run_set(zl, pols, suffix):
-        """Chạy mọi chính sách trong pols cho từng Zipf trong zl với trạng thái churn hiện tại; tên run thêm suffix."""
+    def run_set(zl, pols, suffix, finish=0):
+        """Chạy mọi chính sách trong pols cho từng Zipf trong zl với trạng thái churn hiện tại; tên run thêm suffix.
+        finish > 0 (đợt 10): chính sách có nền dùng lịch nền nguyên xong trước lượt finish, không ghép ngân sách với lazy."""
         for z in zl:
             ranks = np.random.RandomState(a.seed + 43).permutation(len(pool_q))
             p = 1.0 / (ranks + 1.0) ** z
             p /= p.sum()
             stream = pool_q[np.random.RandomState(a.seed + 47 + int(1000 * z)).choice(len(pool_q), size=a.stream, p=p)]
-            log(f"\n=== Zipf s = {z:g}" + (f"   [cấu hình churn {suffix[1:]}]" if suffix else ""))
+            log(f"\n=== Zipf s = {z:g}" + (f"   [migrate tới khi xong, nền xong trước lượt {finish}]" if finish
+                                             else (f"   [cấu hình churn {suffix[1:]}]" if suffix else "")))
             done = {}
             plan = []
             for pol in pols:
-                if pol == "lazyV":
+                if finish and is_bg_policy(pol) and pol != "bgV":
+                    plan.append((pol, pol, confirms[0] if pol.startswith("lazyV") else 0, None))
+                elif pol in ("lazybg", "rebuild"):
+                    log(f"  ({pol} chỉ chạy với --bg-finish) bỏ qua")
+                elif pol == "lazyV":
                     plan += [(f"lazyV{c}", "lazyV", c, None) for c in confirms]
                 elif pol == "bgV":
                     plan += [(f"bgV{c}", "bgV", 0, f"lazyV{c}") for c in confirms]
                 elif pol == "bg":
                     plan.append(("bg", "bg", 0, "lazy"))
-                elif pol in ("lazyVbg", "lazyVbgD"):
+                elif pol in ("lazyVbg", "lazyVbgD") or DCAP_RE.match(pol):
                     plan.append((pol, pol, confirms[0], ("lazy", f"lazyV{confirms[0]}")))
                 else:
                     plan.append((pol, pol, 0, None))
@@ -795,9 +901,14 @@ def main():
                         log(f"  ({name} cần {need}) bỏ qua"); continue
                     rate = (done[need]["f"][-1] * N - nS) / a.stream
                 pol_run = f"lazyV{c}" if pol == "lazyV" else pol
-                rec, snaps = simulate(stream, pol_run, rate, confirm=c)
+                if finish and is_bg_policy(pol):
+                    rate = (N - nS) / finish                   # chỉ để ghi lại; lịch thật là lịch nguyên
+                rec, snaps = simulate(stream, pol_run, rate, confirm=c, finish=(finish if is_bg_policy(pol) else 0))
                 done[name] = rec
                 tt = totals(rec); tt["bg_rate"] = rate
+                tt.update(rec["_mig"])
+                if finish and is_bg_policy(pol):
+                    tt["bg_finish"] = finish
                 if pol == "full":
                     tt["reembed_t0"] = int(N - nS)
                 if pol in ("mapall", "mapkeep"):
@@ -813,13 +924,24 @@ def main():
                     f"retire={tt['retired_total']} dual từ E0/query={tt['dual_from_e0']:4.1f} chấm/query={tt['scan']:7.0f}  "
                     f"[{time.time() - t0:.0f}s]")
                 log("     giữ riêng " + " ".join(f"t{k2}:{v['final']:4.1f}/{v['rr']:4.1f}" for k2, v in snaps.items()))
+                if finish or pol in ("lazybg", "rebuild") or DCAP_RE.match(pol):
+                    m_ = rec["_mig"]
+                    log(f"     xong ở lượt {m_['t_done']}, lưu trữ đỉnh {m_['store_peak']:.1f}% (TB {m_['store_mean']:.1f}%), "
+                        f"dual đỉnh {m_['dual_peak']:.1f}%, retire do trần {m_['cap_retired']}, gỡ E0 khi xong {m_['e0_dropped']}")
                 if "_churn" in rec:
                     c_ = rec["_churn"]
                     log(f"     churn: ghi sửa {c_['repair_w']:.1f}/query, keep-alive {c_['keepalive']:.0f}/query, "
                         f"mất mọi đường cuối dòng {c_['lost_obj_end']:.2f}% (lớn nhất {c_['lost_obj_max']:.2f}%), "
                         "E0 còn bản " + " ".join(f"t{k2}:{v['alive0']:.1f}" for k2, v in snaps.items()))
 
-    run_set(zipfs, a.policies.split(","), "")
+    pols_all = a.policies.split(",")
+    if finishes:                                         # đợt 10: migrate tới khi xong
+        run_set(zipfs, [p_ for p_ in pols_all if not is_bg_policy(p_)], "")
+        out["bg_finish"] = finishes
+        for T_ in finishes:
+            run_set(zipfs, [p_ for p_ in pols_all if is_bg_policy(p_)], f"|T{T_}", finish=T_)
+    else:
+        run_set(zipfs, pols_all, "")
     # cấu hình churn bổ sung trong cùng job (đợt 9): dùng chung phần dựng index và định tuyến ở trên
     csets = parse_churn_sets(a.churn_sets)
     if csets:

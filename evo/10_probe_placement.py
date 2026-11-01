@@ -21,6 +21,13 @@ Biến thể placement (mỗi bảng: W_l (d x 63), ngưỡng t_l, tâm của do
   itq<k>_q, itq<k>_d (đợt 9, thăm dò điểm nóng của ITQ): ITQ trên k thành phần chính (k >= 63) rồi giữ 63 trong k bit.
 --check-prev FILE (đợt 9): so mọi số của các biến thể có trong cả FILE và lượt này (mọi L, T và tải), để chắc biến thể cũ
 không đổi khi chạy lại cùng seed.
+<v>+cap<m> (đợt 10): biến thể v với giới hạn tải. Ở mỗi bảng, mỗi peer nhận tối đa c = ceil(m · N / số node) record (m lần
+  mức trung bình của một bảng). Object đến theo một thứ tự ngẫu nhiên cố định theo seed. Trước hết mỗi peer nhận các record
+  mà nó là peer XOR-gần khoá nhất, theo thứ tự đến, tới khi đủ c; record bị tràn, cũng theo thứ tự đến, đi tới peer đầu tiên
+  còn chỗ trong K = --k-query peer XOR-gần khoá nhất (xếp theo khoảng cách); nếu cả K peer đều đầy thì tới peer ít tải nhất
+  trong K peer đó. Truy vấn vốn hỏi đủ K peer gần nhất của mỗi khoá probe, nên probe trùng khoá vẫn tìm thấy record. Khoá,
+  ngưỡng và định tuyến của v giữ nguyên, chỉ vị trí record đổi; khi c đủ lớn để không peer nào tràn, kết quả trùng v.
+  Ghi thêm số record bị dời ở mỗi bảng.
 Ngân sách: L bảng trong --Ls (mặc định 5,10; bảng đầu của L lớn trùng L nhỏ), T probe mỗi bảng trong --Ts
 (khoá gốc + T-1 lần lật một bit biên nhỏ nhất trong cbits bit đầu, như 04b; T <= cbits + 1), K peer XOR-gần
 nhất mỗi khoá, mỗi peer trả top-kappa.
@@ -151,6 +158,69 @@ def prefix16(bits):
     for j in range(16):
         k = (k << np.int64(1)) | bits[:, j].astype(np.int64)
     return k
+
+
+# ----------------------------------------------------------------- giới hạn tải (đợt 10)
+CAP_RE = re.compile(r"^(.+)\+cap(\d+(?:\.\d+)?)$")
+
+
+def parse_cap(name):
+    """'itq_q+cap16' -> ('itq_q', 16.0); tên không có hậu tố -> (name, None)."""
+    m = CAP_RE.match(name)
+    return (m.group(1), float(m.group(2))) if m else (name, None)
+
+
+def cap_value(mult, n_obj, n_nodes):
+    """Số record tối đa một peer nhận ở một bảng: ceil(mult · N / số node)."""
+    return int(np.ceil(mult * n_obj / n_nodes))
+
+
+def arrival_rank(seed, n_obj):
+    """Thứ tự đến của object (rank[i] = vị trí của object i), cố định theo seed, dùng chung cho 10 và 11."""
+    order = np.random.RandomState(seed + 131).permutation(n_obj)
+    rank = np.empty(n_obj, dtype=np.int64)
+    rank[order] = np.arange(n_obj)
+    return rank
+
+
+def knn_sorted(keys, nid, K, chunk=256):
+    """(len(keys), K) chỉ số node XOR-gần nhất, xếp theo khoảng cách tăng dần (ID node khác nhau nên không hoà)."""
+    out = np.empty((len(keys), K), dtype=np.int64)
+    for s in range(0, len(keys), chunk):
+        d = np.bitwise_xor(nid[None, :], keys[s:s + chunk, None])
+        part = np.argpartition(d, K - 1, axis=1)[:, :K]
+        o = np.argsort(np.take_along_axis(d, part, axis=1), axis=1)
+        out[s:s + chunk] = np.take_along_axis(part, o, axis=1)
+    return out
+
+
+def cap_place(keys, anchors, nid, K, cap, rank):
+    """Placement có giới hạn tải cho một bảng. keys (N,): khoá 63 bit; anchors (N,): peer XOR-gần khoá nhất; rank (N,):
+    thứ tự đến. Mỗi peer giữ trước các record mà nó là peer gần nhất, theo thứ tự đến, tới cap; record tràn đi theo thứ
+    tự đến tới peer đầu tiên còn chỗ trong K peer gần khoá nhất, nếu không còn chỗ thì tới peer ít tải nhất trong K peer
+    đó. -> (anchors mới, số record bị dời)."""
+    anchors = np.asarray(anchors)
+    o = np.lexsort((rank, anchors))                    # theo peer, rồi theo thứ tự đến
+    an = anchors[o]
+    first = np.ones(len(an), dtype=bool)
+    first[1:] = an[1:] != an[:-1]
+    start = np.maximum.accumulate(np.where(first, np.arange(len(an)), 0))
+    keep = (np.arange(len(an)) - start) < cap
+    load = np.bincount(an[keep], minlength=len(nid)).astype(np.int64)
+    newa = anchors.copy()
+    over = o[~keep]
+    if len(over) == 0:
+        return newa, 0
+    over = over[np.argsort(rank[over], kind="stable")]
+    kn = knn_sorted(np.asarray(keys)[over], nid, K)
+    for j, i in enumerate(over.tolist()):
+        c = kn[j]
+        lc = load[c]
+        free = np.flatnonzero(lc < cap)
+        nd = int(c[free[0]]) if len(free) else int(c[int(np.argmin(lc))])
+        newa[i] = nd
+        load[nd] += 1
+    return newa, int(len(over))
 
 
 def main():
@@ -325,30 +395,52 @@ def main():
                gold_oracle5=(None if gold is None else 100 * float(np.mean([gold[i] in set(gt5[i].tolist()) for i in ev]))))
     if gold is not None:
         log(f"nhãn hàm gốc có cho {a.nq} query; hàm gốc nằm trong top-5 chính xác của không gian này: {out['gold_oracle5']:.1f}%")
+    base_cache, rank = {}, None
     for vn in variants:
         tv = time.time()
-        if not vn.startswith("srp") and (d < 63 or nS < 63):
+        base, mult = parse_cap(vn)
+        if not base.startswith("srp") and (d < 63 or nS < 63):
             log(f"[{vn}] bỏ qua: cần d >= 63 và |S| >= 63 (d={d}, |S|={nS})"); continue
-        V = make_variant(vn, E[S], Lmax, a.seed, P_rand, mu_d, mu_q, a.k_pca, a.itq_iters)
-        bits0 = doc_bits(E, V["W"][0], V["t"][0], V["cd"])
-        p1 = bits0[:, :16].mean(0)
-        pre_d = prefix16(bits0)
-        _, cnt = np.unique(pre_d, return_counts=True)
-        pr = cnt / cnt.sum()
-        qb = (qv - V["cq"]) @ V["W"][0] - V["t"][0] > 0
-        pre_q = prefix16(qb)
-        nn_same = float(np.mean([np.mean(pre_d[gt5[ev[i]]] == pre_q[i]) for i in range(len(ev))]))
-        rnd_same = float(np.mean(pre_d[i1] == pre_d[i2]))
-        bitstats = dict(bias16=float(np.mean(np.abs(p1 - 0.5))), eff_buckets16=float(1.0 / (pr ** 2).sum()),
-                        pair_collision16=float((pr ** 2).sum()), nn_same16=nn_same, rand_same16=rnd_same)
-        anchors = np.stack([pb.nearest_node(pack(doc_bits(E, W, t, V["cd"])), nid) for W, t in zip(V["W"], V["t"])])
-        pk = probe_keys(qv, V["W"], V["t"], V["cq"], Tmax, a.cbits)
-        keys = np.stack(pk, axis=1)                                     # (Q, Lmax, Tmax)
-        Q_, L_, T_ = keys.shape
-        nodes = pb.knn_nodes(keys.reshape(-1), nid, a.k_query).reshape(Q_, L_, T_, a.k_query)
-        log(f"[{vn}] index và định tuyến xong ({time.time() - tv:.0f}s)  bit lệch TB={bitstats['bias16']:.3f} "
-            f"bucket16 hiệu dụng={bitstats['eff_buckets16']:,.0f} hàng xóm cùng tiền tố={100 * nn_same:.1f}% "
-            f"(ngẫu nhiên {100 * rnd_same:.2f}%)")
+        if base in base_cache:                                          # biến thể +cap dùng lại khoá và định tuyến
+            bitstats, dkeys, anchors, nodes = base_cache[base]
+            log(f"[{vn}] dùng lại khoá, placement và định tuyến của {base}")
+        else:
+            V = make_variant(base, E[S], Lmax, a.seed, P_rand, mu_d, mu_q, a.k_pca, a.itq_iters)
+            bits0 = doc_bits(E, V["W"][0], V["t"][0], V["cd"])
+            p1 = bits0[:, :16].mean(0)
+            pre_d = prefix16(bits0)
+            _, cnt = np.unique(pre_d, return_counts=True)
+            pr = cnt / cnt.sum()
+            qb = (qv - V["cq"]) @ V["W"][0] - V["t"][0] > 0
+            pre_q = prefix16(qb)
+            nn_same = float(np.mean([np.mean(pre_d[gt5[ev[i]]] == pre_q[i]) for i in range(len(ev))]))
+            rnd_same = float(np.mean(pre_d[i1] == pre_d[i2]))
+            bitstats = dict(bias16=float(np.mean(np.abs(p1 - 0.5))), eff_buckets16=float(1.0 / (pr ** 2).sum()),
+                            pair_collision16=float((pr ** 2).sum()), nn_same16=nn_same, rand_same16=rnd_same)
+            dkeys = [pack(doc_bits(E, W, t, V["cd"])) for W, t in zip(V["W"], V["t"])]
+            anchors = np.stack([pb.nearest_node(k_, nid) for k_ in dkeys])
+            pk = probe_keys(qv, V["W"], V["t"], V["cq"], Tmax, a.cbits)
+            keys = np.stack(pk, axis=1)                                 # (Q, Lmax, Tmax)
+            Q_, L_, T_ = keys.shape
+            nodes = pb.knn_nodes(keys.reshape(-1), nid, a.k_query).reshape(Q_, L_, T_, a.k_query)
+            log(f"[{vn}] index và định tuyến xong ({time.time() - tv:.0f}s)  bit lệch TB={bitstats['bias16']:.3f} "
+                f"bucket16 hiệu dụng={bitstats['eff_buckets16']:,.0f} hàng xóm cùng tiền tố={100 * nn_same:.1f}% "
+                f"(ngẫu nhiên {100 * rnd_same:.2f}%)")
+            base_cache[base] = (bitstats, dkeys, anchors, nodes)
+        capinfo = None
+        if mult is not None:                                            # giới hạn tải (đợt 10)
+            if rank is None:
+                rank = arrival_rank(a.seed, N)
+            cap = cap_value(mult, N, a.nodes)
+            cols, moved = [], []
+            for l_ in range(anchors.shape[0]):
+                na_, mv_ = cap_place(dkeys[l_], anchors[l_], nid, a.k_query, cap, rank)
+                cols.append(na_); moved.append(mv_)
+            anchors = np.stack(cols)
+            capinfo = dict(mult=mult, cap=cap, K=a.k_query, moved=moved,
+                           moved_frac_L5=float(sum(moved[:5]) / (5.0 * N)))
+            log(f"[{vn}] giới hạn {cap} record mỗi peer mỗi bảng (K = {a.k_query}): dời {sum(moved[:5])} record ở 5 bảng đầu "
+                f"({100 * capinfo['moved_frac_L5']:.2f}%), theo bảng {moved}")
         res = {}
         for L in Ls:
             anc = anchors[:L]
@@ -395,6 +487,8 @@ def main():
                     f"top1% peer nhận {100 * r['qload']['top1pct_share']:4.1f}% lượt hỏi, "
                     f"công việc top1%={100 * r['work']['top1pct_share']:4.1f}%")
         out["variants"][vn] = dict(bits=bitstats, results=res)
+        if capinfo is not None:
+            out["variants"][vn]["cap"] = capinfo
         log(f"[{vn}] xong ({time.time() - tv:.0f}s, tổng {time.time() - t0:.0f}s)")
 
     # ---------------- tự kiểm với 04b
