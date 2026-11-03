@@ -28,6 +28,8 @@ không đổi khi chạy lại cùng seed.
   trong K peer đó. Truy vấn vốn hỏi đủ K peer gần nhất của mỗi khoá probe, nên probe trùng khoá vẫn tìm thấy record. Khoá,
   ngưỡng và định tuyến của v giữ nguyên, chỉ vị trí record đổi; khi c đủ lớn để không peer nào tràn, kết quả trùng v.
   Ghi thêm số record bị dời ở mỗi bảng.
+  Đợt 11: ghi thêm số record phải vào peer ít tải nhất vì cả K peer đều đầy (fallback, fallback_frac_L5); vị trí đặt không
+  đổi. Hậu tố +cap vốn dùng được với mọi biến thể từ đợt 10; đợt 11 dùng nó cả với srp, srp_c, pca_q.
 Ngân sách: L bảng trong --Ls (mặc định 5,10; bảng đầu của L lớn trùng L nhỏ), T probe mỗi bảng trong --Ts
 (khoá gốc + T-1 lần lật một bit biên nhỏ nhất trong cbits bit đầu, như 04b; T <= cbits + 1), K peer XOR-gần
 nhất mỗi khoá, mỗi peer trả top-kappa.
@@ -194,11 +196,12 @@ def knn_sorted(keys, nid, K, chunk=256):
     return out
 
 
-def cap_place(keys, anchors, nid, K, cap, rank):
+def cap_place(keys, anchors, nid, K, cap, rank, stats=None):
     """Placement có giới hạn tải cho một bảng. keys (N,): khoá 63 bit; anchors (N,): peer XOR-gần khoá nhất; rank (N,):
     thứ tự đến. Mỗi peer giữ trước các record mà nó là peer gần nhất, theo thứ tự đến, tới cap; record tràn đi theo thứ
     tự đến tới peer đầu tiên còn chỗ trong K peer gần khoá nhất, nếu không còn chỗ thì tới peer ít tải nhất trong K peer
-    đó. -> (anchors mới, số record bị dời)."""
+    đó. -> (anchors mới, số record bị dời). Đợt 11: nếu có dict stats, cộng vào stats["fallback"] số record phải vào
+    peer ít tải nhất vì cả K peer đều đầy (không đổi kết quả đặt)."""
     anchors = np.asarray(anchors)
     o = np.lexsort((rank, anchors))                    # theo peer, rồi theo thứ tự đến
     an = anchors[o]
@@ -213,13 +216,19 @@ def cap_place(keys, anchors, nid, K, cap, rank):
         return newa, 0
     over = over[np.argsort(rank[over], kind="stable")]
     kn = knn_sorted(np.asarray(keys)[over], nid, K)
+    nfb = 0
     for j, i in enumerate(over.tolist()):
         c = kn[j]
         lc = load[c]
         free = np.flatnonzero(lc < cap)
-        nd = int(c[free[0]]) if len(free) else int(c[int(np.argmin(lc))])
+        if len(free):
+            nd = int(c[free[0]])
+        else:
+            nd = int(c[int(np.argmin(lc))]); nfb += 1
         newa[i] = nd
         load[nd] += 1
+    if stats is not None:
+        stats["fallback"] = stats.get("fallback", 0) + nfb
     return newa, int(len(over))
 
 
@@ -432,15 +441,18 @@ def main():
             if rank is None:
                 rank = arrival_rank(a.seed, N)
             cap = cap_value(mult, N, a.nodes)
-            cols, moved = [], []
+            cols, moved, fbs = [], [], []
             for l_ in range(anchors.shape[0]):
-                na_, mv_ = cap_place(dkeys[l_], anchors[l_], nid, a.k_query, cap, rank)
-                cols.append(na_); moved.append(mv_)
+                st_ = {}
+                na_, mv_ = cap_place(dkeys[l_], anchors[l_], nid, a.k_query, cap, rank, stats=st_)
+                cols.append(na_); moved.append(mv_); fbs.append(int(st_.get("fallback", 0)))
             anchors = np.stack(cols)
             capinfo = dict(mult=mult, cap=cap, K=a.k_query, moved=moved,
-                           moved_frac_L5=float(sum(moved[:5]) / (5.0 * N)))
+                           moved_frac_L5=float(sum(moved[:5]) / (5.0 * N)),
+                           fallback=fbs, fallback_frac_L5=float(sum(fbs[:5]) / (5.0 * N)))
             log(f"[{vn}] giới hạn {cap} record mỗi peer mỗi bảng (K = {a.k_query}): dời {sum(moved[:5])} record ở 5 bảng đầu "
-                f"({100 * capinfo['moved_frac_L5']:.2f}%), theo bảng {moved}")
+                f"({100 * capinfo['moved_frac_L5']:.2f}%), theo bảng {moved}; vào peer đầy vì cả K peer đều đầy: "
+                f"{sum(fbs[:5])} ({100 * capinfo['fallback_frac_L5']:.2f}%)")
         res = {}
         for L in Ls:
             anc = anchors[:L]

@@ -101,6 +101,33 @@ Bổ sung đợt 10 (mặc định tắt; khi tắt, mọi chính sách cũ gi�
   Đo thêm mỗi lượt: lưu trữ = (record E0 còn hoạt động + record E1, kể cả bản đang dựng của rebuild) / N; totals ghi
   store_peak, store_mean, dual_peak, t_done (lượt mà sau đó mọi object đã có bản E1; −1 nếu chưa xong).
 
+Bổ sung đợt 11 (mặc định không đổi gì của các chính sách cũ; chỉ thêm chính sách mới và thêm trường đo):
+  lazyVbgDk<c>  lazyVbgD với ngưỡng c xác nhận native (thay cho số đầu của --confirms). Chỉ chạy với --bg-finish.
+  lazyVbgDinf   lazyVbgD không bao giờ retire bản E0 trước khi xong (giữ cả epoch cũ tới khi xong rồi gỡ một lần, kiểu
+            drain); vẫn đếm xác nhận. Chỉ chạy với --bg-finish.
+  --dual-score adapter (đã có từ đợt 7) dùng cho ablation: object dual không có mã E1 tại chỗ, bản E0 giữ điểm adapter,
+            và không tính byte mã E1 gắn thêm.
+  <chính sách>_adp  chạy chính sách đó như với --dual-score adapter, trong cùng job (dùng chung phần dựng index và định
+            tuyến); tên run thêm _adp. Ngân sách nền của lazyVbg_adp, lazyVbgD_adp ghép với lazy và lazyV<c>_adp (nên
+            lazyV_adp phải đứng trước trong --policies). Chỉ khác chính sách gốc khi có object dual.
+  Đo thêm (không đổi số cũ):
+    byte: mỗi lượt, byte mỗi object = (record E0 còn hoạt động × (b0 + meta) + record E1 × (b1 + meta) + object dual × b1
+            nếu --dual-score e1code + record ánh xạ và bản đang dựng × (b1 + meta)) / N, với b0, b1 là số byte mã PQ của
+            E0, E1 và meta trong --bytes-meta; totals ghi bytes_t0_m<meta>, bytes_peak_m<meta>, bytes_mean_m<meta>; mỗi
+            snapshot ghi bytes_m<meta>.
+    mỗi snapshot (query giữ riêng, bỏ qua khi có churn hay mapall, mapkeep): reach_any = phần vị trí trong top-5 thật còn
+            tới được qua ít nhất một đường đang hoạt động (bản E0 còn hoạt động nằm ở peer phía E0 được hỏi, hoặc bản E1 nằm
+            ở peer phía E1 được hỏi); lost_retire = phần vị trí có object ngoài S đã bị retire khỏi E0, tới được qua phía
+            E0 nếu còn, nhưng không tới được qua phía E1 (mất đường tìm do retire); fin_hits, rr_hits = chuỗi một chữ số
+            mỗi query giữ riêng, là số object đúng trong top-5 (để tính negative flip).
+    totals ghi rep_curve: theo lần xuất hiện thứ k của một query trên dòng (k = 1 .. --rep-max, lần cuối gộp mọi k lớn
+            hơn): số lượt, tổng payload, tổng final, tổng rerank; rep_win: với mỗi cửa sổ --window và mỗi lớp lần xuất
+            hiện k1 (lần đầu), k2, k3 (3 tới 5), k6 (6 trở lên): [số lượt, tổng payload, tổng final, tổng rerank];
+            dual_score của run.
+    totals và mỗi cửa sổ ghi emb_q, emb_bg: số lần nhúng lại mỗi lượt do truy vấn (record kéo về, record ánh xạ được
+            thay) và do nền (record nền công bố, và bản E1 rebuild dựng ở nền dù chưa phục vụ). new giữ nguyên định
+            nghĩa cũ (không tính bản dựng ở nền của rebuild).
+
 CHẠY: python3 evo/11_probe_safe.py --tag arctic --dataset code100kfq --seed 3 --nodes 50000 --frac 0.02
 """
 import argparse, importlib.util, json, os, random, re, time
@@ -232,10 +259,38 @@ def ranked_lost(s, active, lost, kappa, need):
 
 
 DCAP_RE = re.compile(r"^lazyVbgDc(\d+(?:\.\d+)?)$")
+KCONF_RE = re.compile(r"^lazyVbgD(?:k(\d+)|(inf))$")       # đợt 11: ngưỡng xác nhận riêng, hoặc không retire trước khi xong
+NEVER = 10 ** 9
+ADP = "_adp"                                               # đợt 11: hậu tố chạy chính sách với --dual-score adapter
+OCC_CLASSES = ((1, 1), (2, 2), (3, 5), (6, 10 ** 9))       # đợt 11: lớp lần xuất hiện của query (k từ 1)
+
+
+def base_pol(p):
+    """Tên chính sách bỏ hậu tố _adp."""
+    return p[:-len(ADP)] if p.endswith(ADP) else p
+
+
+def finish_only(p):
+    """Chính sách chỉ có nghĩa khi migrate tới khi xong (--bg-finish)."""
+    p = base_pol(p)
+    return p in ("lazybg", "rebuild") or KCONF_RE.match(p) is not None
+
+
+def kconf(p, default):
+    """Ngưỡng xác nhận của chính sách p: lazyVbgDk<c> -> c, lazyVbgDinf -> không bao giờ, còn lại -> default."""
+    m = KCONF_RE.match(base_pol(p))
+    if m is None:
+        return default
+    return NEVER if m.group(2) else int(m.group(1))
+
+
+def snap_end_(snaps):
+    return snaps[str(max(int(k) for k in snaps))] if snaps else {}
 
 
 def is_bg_policy(p):
     """Chính sách có migrate nền (đợt 10 thêm lazybg, rebuild, lazyVbgDc<p>)."""
+    p = base_pol(p)
     return p in ("bg", "bgV", "lazyVbg", "lazybg", "rebuild") or p.startswith("lazyVbgD")
 
 
@@ -291,6 +346,8 @@ def main():
     ap.add_argument("--churn-zipf", default="", help="Zipf cho --churn-sets (mặc định như --zipf)")
     ap.add_argument("--e1-cap", type=float, default=0.0, help="giới hạn tải của placement E1 (lần mức trung bình); 0 = tắt")
     ap.add_argument("--bg-finish", default="", help="migrate tới khi xong: danh sách T, nền một mình xong trước lượt T")
+    ap.add_argument("--bytes-meta", default="0,64", help="đợt 11: byte metadata mỗi record dùng khi đếm byte lưu trữ")
+    ap.add_argument("--rep-max", type=int, default=50, help="đợt 11: số mức lần xuất hiện của query trong rep_curve")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     t0 = time.time()
@@ -458,6 +515,18 @@ def main():
     bg_order = perm[nS:]
     Rk = a.R
 
+    # ---------------- đợt 11: byte mã PQ, và khả năng tới được của top-5 thật của query giữ riêng (không phụ thuộc trạng
+    # thái migrate: chỉ phụ thuộc định tuyến và vị trí đặt record, nên tính một lần)
+    bmeta = [int(x) for x in a.bytes_meta.split(",") if x.strip()]
+    b0b, b1b = int(cd0.shape[1]), int(cd1.shape[1])
+    attach_b = b1b if a.dual_score == "e1code" else 0
+    DSM = dict(mode=a.dual_score)              # cách chấm object dual của run đang chạy (đổi theo hậu tố _adp)
+    gt_h = np.stack([gt5_all[ev[q]] for q in held_q])
+    inA_h = np.stack([np.isin(gt5_all[ev[q]], sides_A[q].reach) for q in held_q])
+    inK_h = np.stack([np.isin(gt5_all[ev[q]], sides_K[q].reach) for q in held_q])
+    notS = np.ones(N, dtype=bool); notS[S] = False
+    log(f"đợt 11: byte mã PQ E0 = {b0b}, E1 = {b1b}, mã E1 gắn thêm cho object dual = {attach_b}; metadata {bmeta}")
+
     # ---------------- churn và lỗi peer (đợt 9): lịch sự kiện dùng chung cho mọi chính sách của một cấu hình
     LS = dict(L0=None, LK=None, LM=None, LKM=None)               # bản ghi đã mất của run đang chạy, (L, N) mỗi phía
     IX = {}
@@ -510,7 +579,7 @@ def main():
             dm = inE1[l0]                                 # object dual trả về từ phía E0
             if dm.any():
                 ex = l0[dm & ~np.isin(l0, l1f)]
-                if a.dual_score == "e1code" and len(ex):
+                if DSM["mode"] == "e1code" and len(ex):
                     # peer E0 giữ thêm mã PQ E1 của record đã nâng cấp: client chấm ADC native như phía E1
                     q1n = q1all[qi]
                     kk = np.concatenate([-mc.adc_l2(q1n, cb1, cd1[l1f]), -mc.adc_l2(q1n, cb1, cd1[ex])])
@@ -519,7 +588,7 @@ def main():
                     o = np.argsort(-kk, kind="stable")
                     l1, y1 = ids[o], yy[o]
                     l0, x0 = l0[~dm], x0[~dm]
-                elif a.dual_score == "e1code":
+                elif DSM["mode"] == "e1code":
                     l0, x0 = l0[~dm], x0[~dm]
                 else:                                     # adapter: bản E0 giữ điểm adapter, bỏ bản trùng với native
                     keep = ~np.isin(l0, l1f)
@@ -706,7 +775,7 @@ def main():
         ptr, accb = 0, 0.0
         rec = {k: [] for k in ("final", "rr", "fetch", "new", "nodes", "moved", "f", "rep", "gtE1",
                                "rep_exact", "qlen", "dual", "act0", "conf", "retired", "bonus", "gf", "gr", "scan",
-                               "mapped", "store")}
+                               "mapped", "store", "emb_q", "emb_bg")}
         snaps = {}
         lazyish = policy in ("lazy", "lazyD", "lazybg") or policy.startswith("lazyV")
         # đợt 10: migrate tới khi xong, trần dual, dựng lại ở nền
@@ -722,6 +791,22 @@ def main():
         def store_now():
             return float(int(act0.sum()) + int(inE1.sum()) + int(mapped.sum()) + hidden) / N
         pk = dict(dual=float((inE1 & act0).mean()), store=store_now())   # đỉnh, đo cả ngay trước khi gỡ E0 hay chuyển index
+
+        # đợt 11: byte mỗi object, lần xuất hiện của query trên dòng; chỉ đọc trạng thái, không đổi số cũ
+        att = b1b if DSM["mode"] == "e1code" else 0     # byte mã E1 gắn thêm cho object dual của run này
+
+        def bytes_now(meta):
+            n0, n1 = int(act0.sum()), int(inE1.sum())
+            nd = int((inE1 & act0).sum())
+            nm = int(mapped.sum())
+            return float(n0 * (b0b + meta) + n1 * (b1b + meta) + nd * att + (nm + hidden) * (b1b + meta)) / N
+        pkb = {m: bytes_now(m) for m in bmeta}
+        b_t0 = dict(pkb)
+        bsum = {m: 0.0 for m in bmeta}
+        occ = np.zeros(len(ev), dtype=np.int64)
+        RM = max(1, a.rep_max)
+        rep = dict(n=np.zeros(RM), fetch=np.zeros(RM), final=np.zeros(RM), rr=np.zeros(RM))
+        occk = []                                        # lần xuất hiện (từ 1) của query ở từng lượt
         for t in range(len(stream) + 1):
             if churn_on:
                 churn_tick(t)
@@ -735,6 +820,15 @@ def main():
                                      store=store_now())
                 if churn_on:
                     snaps[str(t)].update(churn_snap())
+                # đợt 11
+                for m in bmeta:
+                    snaps[str(t)][f"bytes_m{m}"] = bytes_now(m)
+                if not churn_on and not maplike:
+                    a0h, e1h = act0[gt_h], inE1[gt_h]
+                    snaps[str(t)]["reach_any"] = 100 * float(((a0h & inA_h) | (e1h & inK_h)).mean())
+                    snaps[str(t)]["lost_retire"] = 100 * float((notS[gt_h] & inA_h & ~a0h & e1h & ~inK_h).mean())
+                snaps[str(t)]["fin_hits"] = "".join(str(int(round(5 * h[0]))) for h in hs)   # một chữ số mỗi query
+                snaps[str(t)]["rr_hits"] = "".join(str(int(round(5 * h[1]))) for h in hs)
             if t == len(stream):
                 break
             qi = int(stream[t])
@@ -742,6 +836,7 @@ def main():
             gtE1 = float(inE1[np.asarray(gq)].mean())
             fin, rr, fetched, nodes, moved, l1, hints, nbonus, gfr, scan = qfun(qi)
             new, nconf, nret = 0, 0, 0
+            eq, eb = 0, 0                                # đợt 11: số lần nhúng lại do truy vấn và do nền
             if maplike:                                  # re-indexer thay record ánh xạ vừa tải bằng record E1 thật
                 docs = np.asarray([x for x in np.unique(hints) if mapped[x]], dtype=np.int64)
                 if len(docs):
@@ -753,6 +848,7 @@ def main():
                     if policy == "mapkeep":              # bản E0 retire khi đã có record E1 thật
                         retire_e0(docs, act0)
                 new += len(docs)
+                eq += len(docs)
             if lazyish:
                 if policy.startswith("lazyV"):
                     dl = l1[inE1[l1] & act0[l1]]          # object dual mà native vừa tìm thấy
@@ -762,6 +858,7 @@ def main():
                 retq = policy in ("lazy", "lazybg")      # lazy, lazybg: retire bản E0 ngay
                 mg = publish(fetched if retq else hints, inE1, act0, retire=retq)
                 new += len(mg)
+                eq += len(mg)
                 if dcap is not None:
                     fifo.extend(mg.tolist())
             if has_bg:
@@ -771,7 +868,9 @@ def main():
                     accb += bg_rate
                     k = int(accb); accb -= k
                 if policy == "rebuild":                  # dựng ở nền, chưa phục vụ
+                    h0_ = hidden
                     hidden = min(nbS, hidden + k)
+                    eb += hidden - h0_                   # bản E1 dựng ở nền cũng là một lần nhúng lại
                 else:
                     take = []
                     while len(take) < k and ptr < len(bg_order):
@@ -780,6 +879,7 @@ def main():
                             take.append(x)
                     pg = publish(take, inE1, act0, retire=not dual_bg)
                     new += len(pg)
+                    eb += len(pg)
                     if dcap is not None:
                         fifo.extend(pg.tolist())
             if dcap is not None:                         # trần dual: retire bản E0 của object dual cũ nhất
@@ -793,6 +893,8 @@ def main():
                     mig["cap_retired"] += len(retire_e0(np.asarray(batch, dtype=np.int64), act0))
             pk["dual"] = max(pk["dual"], float((inE1 & act0).mean()))
             pk["store"] = max(pk["store"], store_now())
+            for m in bmeta:                              # đợt 11: đỉnh byte, cùng thời điểm đo đỉnh lưu trữ
+                pkb[m] = max(pkb[m], bytes_now(m))
             if policy == "rebuild" and hidden >= nbS and not inE1.all():   # dựng xong: chuyển hẳn sang index mới
                 inE1[:] = True; act0[:] = False; hidden = 0
                 load["0"] = np.zeros(a.nodes, dtype=np.int64)
@@ -808,11 +910,41 @@ def main():
                           ("rep_exact", bool(seen[qi])), ("qlen", 0), ("dual", float((inE1 & act0).mean())),
                           ("act0", float(act0.mean())), ("conf", nconf), ("retired", nret), ("bonus", nbonus),
                           ("gf", gfr[0]), ("gr", gfr[1]), ("scan", scan), ("mapped", float(mapped.mean())),
-                          ("store", store_now())):
+                          ("store", store_now()), ("emb_q", eq), ("emb_bg", eb)):
                 rec[kk].append(v)
+            for m in bmeta:                              # đợt 11
+                bsum[m] += bytes_now(m)
+            k_ = min(int(occ[qi]), RM - 1)
+            rep["n"][k_] += 1; rep["fetch"][k_] += len(fetched); rep["final"][k_] += fin; rep["rr"][k_] += rr
+            occ[qi] += 1
+            occk.append(int(occ[qi]))
             seen[qi] = True
         rec["_mig"] = dict(mig, store_peak=100 * pk["store"], dual_peak=100 * pk["dual"],
                            store_mean=100 * float(np.mean(rec["store"])) if rec["store"] else float("nan"))
+        nt = max(1, len(rec["store"]))
+        r11 = {}
+        for m in bmeta:
+            r11[f"bytes_t0_m{m}"] = b_t0[m]
+            r11[f"bytes_peak_m{m}"] = pkb[m]
+            r11[f"bytes_mean_m{m}"] = bsum[m] / nt if rec["store"] else float("nan")
+        r11["rep_curve"] = {k: [float(x) for x in v] for k, v in rep.items()}
+        # theo cửa sổ --window và lớp lần xuất hiện (1, 2, 3-5, 6+): [số lượt, tổng payload, tổng final, tổng rerank]
+        ok_ = np.asarray(occk, dtype=np.int64)
+        fe_ = np.asarray(rec["fetch"], dtype=float)
+        fi_ = np.asarray(rec["final"], dtype=float)
+        rr_ = np.asarray(rec["rr"], dtype=float)
+        rw = []
+        for s_ in range(0, len(ok_), a.window):
+            e_ = min(len(ok_), s_ + a.window)
+            row = dict(t_end=int(e_))
+            for lo_, hi_ in OCC_CLASSES:
+                m_ = (ok_[s_:e_] >= lo_) & (ok_[s_:e_] <= hi_)
+                row[f"k{lo_}"] = [int(m_.sum()), float(fe_[s_:e_][m_].sum()), float(fi_[s_:e_][m_].sum()),
+                                  float(rr_[s_:e_][m_].sum())]
+            rw.append(row)
+        r11["rep_win"] = rw
+        r11["dual_score"] = DSM["mode"]
+        rec["_r11"] = r11
         if churn_on:
             ns = max(1, len(stream))
             rec["_churn"] = dict(repair_w=cst["repair_w"] / ns, keepalive=cst["keepalive"] / ns, departures=cst["dep"],
@@ -836,7 +968,8 @@ def main():
                             n_rep=int(rep.sum()), fetch=float(np.mean(rec["fetch"][sl])),
                             new=float(np.mean(rec["new"][sl])), nodes=float(np.mean(rec["nodes"][sl])),
                             moved=float(np.mean(rec["moved"][sl])), gtE1=100 * float(np.mean(rec["gtE1"][sl])),
-                            dual=100 * float(rec["dual"][e - 1]), store=100 * float(rec["store"][e - 1])))
+                            dual=100 * float(rec["dual"][e - 1]), store=100 * float(rec["store"][e - 1]),
+                            emb_q=float(np.mean(rec["emb_q"][sl])), emb_bg=float(np.mean(rec["emb_bg"][sl]))))
         return out
 
     def totals(rec):
@@ -855,7 +988,8 @@ def main():
                     act0_end=100 * float(rec["act0"][-1]), conf_total=int(np.sum(rec["conf"])),
                     retired_total=int(np.sum(rec["retired"])), dual_from_e0=float(np.mean(rec["bonus"])),
                     gold_final=100 * float(np.mean(rec["gf"])), gold_rr=100 * float(np.mean(rec["gr"])),
-                    scan=float(np.mean(rec["scan"])), mapped_end=100 * float(rec["mapped"][-1]))
+                    scan=float(np.mean(rec["scan"])), mapped_end=100 * float(rec["mapped"][-1]),
+                    emb_q=float(np.mean(rec["emb_q"])), emb_bg=float(np.mean(rec["emb_bg"])))
 
     out = dict(argv=vars(a), N=int(N), n_sample=int(nS), cal=ols_ad, sig1=sig1, runs={}, check_06=None,
                check_10=check10, native_f1=nat1, numpy=np.__version__, e1_storage=stK)
@@ -863,6 +997,8 @@ def main():
         out["e1_cap"] = e1cap_info
     if churn_on:
         out["churn"] = churn_info
+    out["r11"] = dict(bytes_meta=bmeta, b0=b0b, b1=b1b, attach=attach_b, dual_score=a.dual_score, rep_max=a.rep_max,
+                      n_heldout=int(len(held_q)))
     def run_set(zl, pols, suffix, finish=0):
         """Chạy mọi chính sách trong pols cho từng Zipf trong zl với trạng thái churn hiện tại; tên run thêm suffix.
         finish > 0 (đợt 10): chính sách có nền dùng lịch nền nguyên xong trước lượt finish, không ghép ngân sách với lazy."""
@@ -875,22 +1011,33 @@ def main():
                                              else (f"   [cấu hình churn {suffix[1:]}]" if suffix else "")))
             done = {}
             plan = []
-            for pol in pols:
+            for pol_full in pols:
+                pol = base_pol(pol_full)
+                mode = "adapter" if pol_full.endswith(ADP) else None    # đợt 11: run chấm object dual bằng adapter
+                ent = []
                 if finish and is_bg_policy(pol) and pol != "bgV":
-                    plan.append((pol, pol, confirms[0] if pol.startswith("lazyV") else 0, None))
-                elif pol in ("lazybg", "rebuild"):
-                    log(f"  ({pol} chỉ chạy với --bg-finish) bỏ qua")
+                    ent.append((pol, pol, kconf(pol, confirms[0]) if pol.startswith("lazyV") else 0, None))
+                elif finish_only(pol):
+                    log(f"  ({pol_full} chỉ chạy với --bg-finish) bỏ qua")
                 elif pol == "lazyV":
-                    plan += [(f"lazyV{c}", "lazyV", c, None) for c in confirms]
+                    ent += [(f"lazyV{c}", "lazyV", c, None) for c in confirms]
                 elif pol == "bgV":
-                    plan += [(f"bgV{c}", "bgV", 0, f"lazyV{c}") for c in confirms]
+                    ent += [(f"bgV{c}", "bgV", 0, f"lazyV{c}") for c in confirms]
                 elif pol == "bg":
-                    plan.append(("bg", "bg", 0, "lazy"))
+                    ent.append(("bg", "bg", 0, "lazy"))
                 elif pol in ("lazyVbg", "lazyVbgD") or DCAP_RE.match(pol):
-                    plan.append((pol, pol, confirms[0], ("lazy", f"lazyV{confirms[0]}")))
+                    ent.append((pol, pol, confirms[0], ("lazy", f"lazyV{confirms[0]}")))
                 else:
-                    plan.append((pol, pol, 0, None))
-            for name, pol, c, need in plan:
+                    ent.append((pol, pol, 0, None))
+                for name, p_, c, need in ent:
+                    if mode:                                   # tên thêm _adp; ngân sách ghép với lazyV<c>_adp
+                        name += ADP
+                        if isinstance(need, tuple):
+                            need = (need[0], need[1] + ADP)
+                        elif need is not None and need.startswith("lazyV"):
+                            need += ADP
+                    plan.append((name, p_, c, need, mode))
+            for name, pol, c, need, mode in plan:
                 rate = 0.0
                 if isinstance(need, tuple):                   # lazyVbg: bù cho đủ số record lazy công bố
                     if any(x not in done for x in need):
@@ -903,10 +1050,17 @@ def main():
                 pol_run = f"lazyV{c}" if pol == "lazyV" else pol
                 if finish and is_bg_policy(pol):
                     rate = (N - nS) / finish                   # chỉ để ghi lại; lịch thật là lịch nguyên
-                rec, snaps = simulate(stream, pol_run, rate, confirm=c, finish=(finish if is_bg_policy(pol) else 0))
+                DSM["mode"] = mode or a.dual_score
+                try:
+                    rec, snaps = simulate(stream, pol_run, rate, confirm=c, finish=(finish if is_bg_policy(pol) else 0))
+                finally:
+                    DSM["mode"] = a.dual_score
                 done[name] = rec
                 tt = totals(rec); tt["bg_rate"] = rate
                 tt.update(rec["_mig"])
+                tt.update(rec["_r11"])                           # đợt 11: byte, rep_curve (trường mới, số cũ không đổi)
+                if KCONF_RE.match(pol):
+                    tt["confirm_k"] = c
                 if finish and is_bg_policy(pol):
                     tt["bg_finish"] = finish
                 if pol == "full":
@@ -928,6 +1082,11 @@ def main():
                     m_ = rec["_mig"]
                     log(f"     xong ở lượt {m_['t_done']}, lưu trữ đỉnh {m_['store_peak']:.1f}% (TB {m_['store_mean']:.1f}%), "
                         f"dual đỉnh {m_['dual_peak']:.1f}%, retire do trần {m_['cap_retired']}, gỡ E0 khi xong {m_['e0_dropped']}")
+                if bmeta:                                       # đợt 11
+                    m0_ = bmeta[0]
+                    log(f"     byte/object (meta {m0_}): đầu {tt[f'bytes_t0_m{m0_}']:.0f}, đỉnh {tt[f'bytes_peak_m{m0_}']:.0f}, "
+                        f"TB {tt[f'bytes_mean_m{m0_}']:.0f}; mất đường do retire cuối dòng "
+                        f"{snap_end_(snaps).get('lost_retire', float('nan')):.2f}%")
                 if "_churn" in rec:
                     c_ = rec["_churn"]
                     log(f"     churn: ghi sửa {c_['repair_w']:.1f}/query, keep-alive {c_['keepalive']:.0f}/query, "
