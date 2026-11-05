@@ -92,7 +92,9 @@ def main():
     rng = np.random.RandomState(0)
     idx = rng.choice(len(raw), min(a.n_check, len(raw)), replace=False)
     qidx = rng.choice(len(queries), min(a.n_check, len(queries)), replace=False)
-    m0 = SentenceTransformer(a.m0, device=a.device)
+    # đợt 11, sửa 1: ép float32. Bản transformers mới nạp model theo kiểu dữ liệu lưu trong checkpoint; checkpoint lưu
+    # float16 (như thenlper/gte-base) khi đó chạy float16 trên CPU: rất chậm và sai số làm tròn vượt bước kiểm chuẩn hoá.
+    m0 = SentenceTransformer(a.m0, device=a.device).float()
     enc0 = lambda xs: m0.encode(xs, batch_size=16, normalize_embeddings=True,
                                 convert_to_numpy=True, show_progress_bar=False)
     if isinstance(raw[0], str):
@@ -130,11 +132,11 @@ def main():
     # ---------- nhúng bằng M1
     qp, pp = pick_prefix(a.model, a.query_prefix, a.passage_prefix)
     print(f"model={a.model}\nquery_prefix={qp!r}  passage_prefix={pp!r}")
-    m = SentenceTransformer(a.model, device=a.device)
+    m = SentenceTransformer(a.model, device=a.device).float()   # đợt 11, sửa 1: ép float32 (xem ghi chú ở m0)
     if a.max_seq:
         m.max_seq_length = a.max_seq
     dev = str(m.device)
-    print(f"device={dev}  max_seq={m.max_seq_length}")
+    print(f"device={dev}  max_seq={m.max_seq_length}  dtype={next(m.parameters()).dtype}")
     if dev.startswith("cpu"):
         n = min(200, len(texts))
         s = time.time()

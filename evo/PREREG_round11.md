@@ -195,3 +195,21 @@ Phần này không có ngưỡng. Đại lượng chính chốt trước để t
   xong, mọi chính sách có nền phải trùng full ở mọi checkpoint; trước lượt xong, rebuild phải trùng static;
   lazyVbgDinf không retire bản E0 nào trước khi xong; số lần nhúng lại do truy vấn cộng do nền bằng `new` (trừ rebuild),
   và rebuild dựng đủ N − |S| bản ở nền.
+
+## 5. Sửa đổi sau khi bắt đầu chạy
+
+**Sửa 1 (5/11/2026, tag `evo-r11-fix1`).** Job nhúng gte-base trên code 20k chạy 27,6 giờ rồi dừng ở bước tự kiểm cuối
+của `01_embed_m1.py`: độ dài các vector corpus nằm trong [0,99951; 1,00049], trung bình lệch 1 quá ngưỡng 1e-4, nên
+script không ghi file nào.
+
+- Nguyên nhân: checkpoint `thenlper/gte-base` lưu ở float16, và bản transformers trên server nạp model theo kiểu dữ liệu
+  của checkpoint. Toàn bộ phép tính vì thế chạy float16 trên CPU, chậm khoảng 15 lần so với float32, và sai số làm tròn
+  của float16 (cỡ 5e-4) vượt ngưỡng kiểm. MiniLM và bge-large lưu ở float32 nên không bị; embedding MiniLM đã ghi giữ
+  nguyên.
+- Diff: `01_embed_m1.py` gọi `.float()` ngay sau khi nạp cả model M0 (dùng để tự kiểm) lẫn model M1, và in thêm kiểu dữ
+  liệu ở dòng `device=... max_seq=... dtype=...`. Không file probe, analyze hay run nào đổi.
+- Job gte-base trên SciFact đang chạy bằng code cũ (cùng lỗi) bị dừng. Hai job nhúng gte-base chạy lại bằng code đã sửa,
+  với `NTE=4` (xem lỗi dưới), rồi chạy pha N. Kết quả của 237 job đã xong (R, A, B, C, G, F và ba job nhúng MiniLM)
+  giữ nguyên.
+- Lỗi đã biết, không sửa trong đợt này: `run_round11.sh` tính NTE bằng `nproc` sau khi đã đặt `OMP_NUM_THREADS=1`, mà
+  `nproc` đọc biến này, nên pha nhúng chạy 1 luồng. Lượt chạy lại truyền `NTE=4`. Sẽ sửa trong script đợt sau.
