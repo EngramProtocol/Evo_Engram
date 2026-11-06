@@ -9,7 +9,8 @@ khoá E1, nên reach và rerank giảm so với lúc record còn ở E0. Ở đ�
 (dual): phía E0 vẫn trả record cũ, phía E1 trả record mới, danh sách gộp bỏ bản trùng. Mỗi lần một
 truy vấn thấy object dual qua khoá E1 trong danh sách native của chính nó, client gửi một xác nhận; đủ c
 xác nhận thì re-indexer retire bản E0. Tính chất giữ được: object không mất đường tìm cũ trước khi đường mới
-đã được c truy vấn độc lập dùng thành công.
+đã được dùng thành công c lần. Các lần này có thể đến từ cùng một query lặp lại, nên chưa phải c truy vấn độc
+lập (đợt 12 thêm biến thể chỉ đếm query khác nhau và biến thể có veto, xem cuối phần mô tả).
 
 Thiết lập giữ đúng 06_probe_lazy.py (khoá E1 'u', adapter A_split_norm học trên S, gộp PROB, dòng Zipf
 3.000 lượt trên 200 query, 100 query giữ riêng, re-indexer không giới hạn). Chính sách:
@@ -127,6 +128,23 @@ Bổ sung đợt 11 (mặc định không đổi gì của các chính sách cũ
     totals và mỗi cửa sổ ghi emb_q, emb_bg: số lần nhúng lại mỗi lượt do truy vấn (record kéo về, record ánh xạ được
             thay) và do nền (record nền công bố, và bản E1 rebuild dựng ở nền dù chưa phục vụ). new giữ nguyên định
             nghĩa cũ (không tính bản dựng ở nền của rebuild).
+
+Bổ sung đợt 12 (mặc định không đổi gì của các chính sách cũ; chỉ thêm chính sách, một tham số và trường đo):
+  Một "lần thấy" là một truy vấn của dòng có object dual trong danh sách native phía E1 của nó (như xác nhận của
+  lazyV<c> từ đợt 7). Đếm như đợt 7 đến 11 là đếm mọi lần thấy, kể cả khi cùng một query lặp lại.
+  lazyVbgDu<c>   lazyVbgD, nhưng chỉ đếm lần thấy từ các query khác nhau (một query lặp lại chỉ tính một lần cho mỗi
+            object); retire bản E0 khi đủ c query khác nhau. c <= 3.
+  lazyVbgDv<c>   lazyVbgDk<c> có veto: khi một truy vấn của dòng có object dual trong danh sách phía E0 (đã cắt như
+            --dual-slots) mà không có nó trong danh sách native phía E1, bộ đếm của object đó về 0.
+  lazyVbgDuv<c>  kết hợp u và v: đếm query khác nhau, veto đưa bộ đếm (và danh sách query đã đếm) về 0. c <= 3.
+            Cả ba chỉ chạy với --bg-finish, như lazyVbgDk<c>.
+  --finish-drop done | T   done (mặc định, như đợt 10 và 11): khi mọi object đã có bản E1, gỡ cả index E0 ngay (lượt
+            xong). T: gỡ cả index E0 ở đúng lượt T của --bg-finish, sau truy vấn thứ T, cho mọi chính sách có nền. Riêng
+            nền đã xong trước T nên tới T mọi object đều có bản E1; giữa lượt xong và T các chính sách họ lazyVbgD vẫn
+            nhận lần thấy và retire như trước. Mục đích: so các quy tắc retire ở cùng thời điểm gỡ E0.
+  Đo thêm: totals ghi vetoes (tổng số lần veto, mỗi object bị veto ở một lượt tính một), conf_distinct (tổng số lần
+            thấy từ query chưa từng thấy object đó, chỉ với u, uv), t_drop (lượt gỡ E0 khi --finish-drop T, ngược lại −1),
+            confirm_kind (k, u, v, uv) cùng confirm_k, và finish_drop của run có nền khi --bg-finish.
 
 CHẠY: python3 evo/11_probe_safe.py --tag arctic --dataset code100kfq --seed 3 --nodes 50000 --frac 0.02
 """
@@ -259,7 +277,10 @@ def ranked_lost(s, active, lost, kappa, need):
 
 
 DCAP_RE = re.compile(r"^lazyVbgDc(\d+(?:\.\d+)?)$")
-KCONF_RE = re.compile(r"^lazyVbgD(?:k(\d+)|(inf))$")       # đợt 11: ngưỡng xác nhận riêng, hoặc không retire trước khi xong
+# đợt 11: lazyVbgDk<c> (ngưỡng xác nhận riêng), lazyVbgDinf (không retire trước khi xong);
+# đợt 12: lazyVbgDu<c> (chỉ đếm query khác nhau), lazyVbgDv<c> (có veto), lazyVbgDuv<c> (cả hai)
+KCONF_RE = re.compile(r"^lazyVbgD(?:(k|uv|u|v)(\d+)|(inf))$")
+UNIQ_MAX = 3                                               # đợt 12: ngưỡng lớn nhất khi đếm query khác nhau
 NEVER = 10 ** 9
 ADP = "_adp"                                               # đợt 11: hậu tố chạy chính sách với --dual-score adapter
 OCC_CLASSES = ((1, 1), (2, 2), (3, 5), (6, 10 ** 9))       # đợt 11: lớp lần xuất hiện của query (k từ 1)
@@ -276,12 +297,44 @@ def finish_only(p):
     return p in ("lazybg", "rebuild") or KCONF_RE.match(p) is not None
 
 
-def kconf(p, default):
-    """Ngưỡng xác nhận của chính sách p: lazyVbgDk<c> -> c, lazyVbgDinf -> không bao giờ, còn lại -> default."""
+def cpred(p):
+    """Quy tắc retire của chính sách họ KCONF_RE: (loại, c) với loại k, u, v, uv; lazyVbgDinf -> ('k', NEVER).
+    Chính sách khác -> None."""
     m = KCONF_RE.match(base_pol(p))
     if m is None:
-        return default
-    return NEVER if m.group(2) else int(m.group(1))
+        return None
+    return ("k", NEVER) if m.group(3) else (m.group(1), int(m.group(2)))
+
+
+def kconf(p, default):
+    """Ngưỡng xác nhận của chính sách p: lazyVbgD{k,u,v,uv}<c> -> c, lazyVbgDinf -> không bao giờ, còn lại -> default."""
+    cp_ = cpred(p)
+    return default if cp_ is None else cp_[1]
+
+
+def retire_ready(dl, vt, qi, confirm, conf, uq=None, ucnt=None, veto=False):
+    """Bộ đếm xác nhận cho một truy vấn qi của dòng; trả về các object đủ điều kiện retire bản E0.
+    dl: object dual có trong danh sách native phía E1 của truy vấn (mỗi object một lần thấy); vt: object dual có trong danh
+    sách phía E0 nhưng không có trong danh sách native (chỉ dùng khi veto=True: bộ đếm của chúng về 0 trước khi đếm dl).
+    conf đếm mọi lần thấy (đợt 7 đến 11). Có uq, ucnt (đợt 12) thì chỉ đếm query khác nhau: uq giữ tối đa uq.shape[1] query
+    đã đếm của mỗi object, đủ cho ngưỡng tới uq.shape[1] + 1. -> (ready, số veto, số lần thấy từ query mới)."""
+    nveto = nuconf = 0
+    if veto and len(vt):
+        conf[vt] = 0; nveto = len(vt)
+        if uq is not None:
+            ucnt[vt] = 0; uq[vt] = -1
+    if not len(dl):
+        return dl, nveto, nuconf
+    conf[dl] += 1
+    if uq is None:
+        return dl[conf[dl] >= confirm], nveto, nuconf
+    fresh = dl[(uq[dl] != qi).all(1)]
+    if len(fresh):
+        free = uq[fresh] < 0
+        has = free.any(1)
+        uq[fresh[has], np.argmax(free[has], axis=1)] = qi
+        ucnt[fresh] += 1; nuconf = len(fresh)
+    return dl[ucnt[dl] >= confirm], nveto, nuconf
 
 
 def snap_end_(snaps):
@@ -348,8 +401,16 @@ def main():
     ap.add_argument("--bg-finish", default="", help="migrate tới khi xong: danh sách T, nền một mình xong trước lượt T")
     ap.add_argument("--bytes-meta", default="0,64", help="đợt 11: byte metadata mỗi record dùng khi đếm byte lưu trữ")
     ap.add_argument("--rep-max", type=int, default=50, help="đợt 11: số mức lần xuất hiện của query trong rep_curve")
+    ap.add_argument("--finish-drop", default="done", choices=["done", "T"],
+                    help="đợt 12: gỡ index E0 khi mọi object đã có bản E1 (done) hay đúng ở lượt T của --bg-finish (T)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
+    for p_ in [x for x in (a.policies + "," + a.churn_policies).split(",") if x]:
+        cp_ = cpred(p_)
+        if cp_ is not None and cp_[0] != "k" and not (1 <= cp_[1] <= (UNIQ_MAX if "u" in cp_[0] else NEVER)):
+            raise SystemExit(f"{p_}: ngưỡng phải từ 1" + (f" tới {UNIQ_MAX} khi đếm query khác nhau" if "u" in cp_[0] else ""))
+    if a.finish_drop == "T" and not a.bg_finish.strip():
+        raise SystemExit("--finish-drop T cần --bg-finish")
     t0 = time.time()
     D, ds = a.data_dir, a.dataset
     T = a.probes
@@ -555,6 +616,7 @@ def main():
         return True, evp, rp, info
 
     churn_on, ev_pos, reps, churn_info = setup_churn(a)
+    QX = dict(veto=np.zeros(0, dtype=np.int64))                  # đợt 12: danh sách veto của truy vấn vừa chạy
 
     def one_query(qi, act0, inE1):
         """-> final, rerank, record được tải payload, nodes, moved, danh sách native, gợi ý (record chỉ có ở E0)."""
@@ -575,6 +637,9 @@ def main():
         l0, x0 = np.asarray(l0, dtype=np.int64), np.asarray(x0)
         l1f = np.asarray(l1, dtype=np.int64)              # danh sách tìm được qua khoá E1 (dùng để xác nhận)
         ex_all = l0[inE1[l0]] if len(l0) else l0          # object dual nhận từ phía E0 (thêm byte trả về)
+        # đợt 12: object dual có trong danh sách phía E0 nhưng không có trong danh sách native phía E1 (veto); chỉ ghi
+        # lại để simulate đọc, không đổi gì của truy vấn
+        QX["veto"] = ex_all[~np.isin(ex_all, l1f)] if len(ex_all) else np.zeros(0, dtype=np.int64)
         if len(l0):
             dm = inE1[l0]                                 # object dual trả về từ phía E0
             if dm.any():
@@ -771,11 +836,18 @@ def main():
             return dict(alive0=100 * float(p0.sum()) / max(1, int(act0.sum())),
                         aliveK=100 * float(pK.sum()) / max(1, int(inE1.sum())), lost_obj=lo)
         conf = np.zeros(N, dtype=np.int32)
+        # đợt 12: quy tắc retire. k: đếm mọi lần thấy (như đợt 7 đến 11); u: chỉ đếm query khác nhau; v, uv: thêm veto
+        cp_ = cpred(policy)
+        ckind = cp_[0] if cp_ is not None else "k"
+        uniq_on, veto_on = ckind in ("u", "uv"), ckind in ("v", "uv")
+        ucnt = np.zeros(N, dtype=np.int32) if uniq_on else None          # số query khác nhau đã thấy object
+        uq = np.full((N, UNIQ_MAX - 1), -1, dtype=np.int64) if uniq_on else None   # các query đó (đủ cho c <= UNIQ_MAX)
+        fixed_drop = bool(finish) and a.finish_drop == "T"
         seen = np.zeros(len(ev), dtype=bool)
         ptr, accb = 0, 0.0
         rec = {k: [] for k in ("final", "rr", "fetch", "new", "nodes", "moved", "f", "rep", "gtE1",
                                "rep_exact", "qlen", "dual", "act0", "conf", "retired", "bonus", "gf", "gr", "scan",
-                               "mapped", "store", "emb_q", "emb_bg")}
+                               "mapped", "store", "emb_q", "emb_bg", "veto", "uconf")}
         snaps = {}
         lazyish = policy in ("lazy", "lazyD", "lazybg") or policy.startswith("lazyV")
         # đợt 10: migrate tới khi xong, trần dual, dựng lại ở nền
@@ -786,7 +858,7 @@ def main():
         fifo, fptr = [], 0                               # thứ tự object trở thành dual (cho trần dual)
         hidden = 0                                       # rebuild: số bản E1 đã dựng ở nền, chưa phục vụ
         nbS = N - nS
-        mig = dict(t_done=(0 if inE1.all() else -1), cap_retired=0, e0_dropped=0)
+        mig = dict(t_done=(0 if inE1.all() else -1), cap_retired=0, e0_dropped=0, t_drop=-1)
 
         def store_now():
             return float(int(act0.sum()) + int(inE1.sum()) + int(mapped.sum()) + hidden) / N
@@ -834,8 +906,10 @@ def main():
             qi = int(stream[t])
             gq = gt5_all[ev[qi]]
             gtE1 = float(inE1[np.asarray(gq)].mean())
+            QX["veto"] = np.zeros(0, dtype=np.int64)
             fin, rr, fetched, nodes, moved, l1, hints, nbonus, gfr, scan = qfun(qi)
             new, nconf, nret = 0, 0, 0
+            nveto, nuconf = 0, 0                         # đợt 12: số veto, số lần thấy từ query mới
             eq, eb = 0, 0                                # đợt 11: số lần nhúng lại do truy vấn và do nền
             if maplike:                                  # re-indexer thay record ánh xạ vừa tải bằng record E1 thật
                 docs = np.asarray([x for x in np.unique(hints) if mapped[x]], dtype=np.int64)
@@ -851,10 +925,13 @@ def main():
                 eq += len(docs)
             if lazyish:
                 if policy.startswith("lazyV"):
+                    vt = QX["veto"]                      # đợt 12: thấy qua E0 mà không thấy qua E1
+                    vt = vt[act0[vt] & inE1[vt]] if (veto_on and len(vt)) else vt[:0]
                     dl = l1[inE1[l1] & act0[l1]]          # object dual mà native vừa tìm thấy
+                    nconf = len(dl)
+                    ready, nveto, nuconf = retire_ready(dl, vt, qi, confirm, conf, uq, ucnt, veto_on)
                     if len(dl):
-                        conf[dl] += 1; nconf = len(dl)
-                        nret = len(retire_e0(dl[conf[dl] >= confirm], act0))
+                        nret = len(retire_e0(ready, act0))
                 retq = policy in ("lazy", "lazybg")      # lazy, lazybg: retire bản E0 ngay
                 mg = publish(fetched if retq else hints, inE1, act0, retire=retq)
                 new += len(mg)
@@ -903,14 +980,20 @@ def main():
                     LS["LK"][:] = False
             if mig["t_done"] < 0 and inE1.all():
                 mig["t_done"] = t + 1
-                if finish and act0.any():                # xong: gỡ toàn bộ index E0
+                if finish and not fixed_drop and act0.any():   # xong: gỡ toàn bộ index E0
+                    mig["e0_dropped"] += len(retire_e0(np.flatnonzero(act0), act0))
+            if fixed_drop and t + 1 == finish:           # đợt 12: gỡ toàn bộ index E0 đúng ở lượt T
+                mig["t_drop"] = t + 1
+                if not inE1.all():
+                    log(f"  CẢNH BÁO {policy}: tới lượt {finish} vẫn còn {int((~inE1).sum())} object chưa có bản E1")
+                if act0.any():
                     mig["e0_dropped"] += len(retire_e0(np.flatnonzero(act0), act0))
             for kk, v in (("final", fin), ("rr", rr), ("fetch", len(fetched)), ("new", new), ("nodes", nodes),
                           ("moved", moved), ("f", float(inE1.mean())), ("rep", bool(seen[qi])), ("gtE1", gtE1),
                           ("rep_exact", bool(seen[qi])), ("qlen", 0), ("dual", float((inE1 & act0).mean())),
                           ("act0", float(act0.mean())), ("conf", nconf), ("retired", nret), ("bonus", nbonus),
                           ("gf", gfr[0]), ("gr", gfr[1]), ("scan", scan), ("mapped", float(mapped.mean())),
-                          ("store", store_now()), ("emb_q", eq), ("emb_bg", eb)):
+                          ("store", store_now()), ("emb_q", eq), ("emb_bg", eb), ("veto", nveto), ("uconf", nuconf)):
                 rec[kk].append(v)
             for m in bmeta:                              # đợt 11
                 bsum[m] += bytes_now(m)
@@ -989,7 +1072,8 @@ def main():
                     retired_total=int(np.sum(rec["retired"])), dual_from_e0=float(np.mean(rec["bonus"])),
                     gold_final=100 * float(np.mean(rec["gf"])), gold_rr=100 * float(np.mean(rec["gr"])),
                     scan=float(np.mean(rec["scan"])), mapped_end=100 * float(rec["mapped"][-1]),
-                    emb_q=float(np.mean(rec["emb_q"])), emb_bg=float(np.mean(rec["emb_bg"])))
+                    emb_q=float(np.mean(rec["emb_q"])), emb_bg=float(np.mean(rec["emb_bg"])),
+                    vetoes=int(np.sum(rec["veto"])), conf_distinct=int(np.sum(rec["uconf"])))
 
     out = dict(argv=vars(a), N=int(N), n_sample=int(nS), cal=ols_ad, sig1=sig1, runs={}, check_06=None,
                check_10=check10, native_f1=nat1, numpy=np.__version__, e1_storage=stK)
@@ -1007,8 +1091,9 @@ def main():
             p = 1.0 / (ranks + 1.0) ** z
             p /= p.sum()
             stream = pool_q[np.random.RandomState(a.seed + 47 + int(1000 * z)).choice(len(pool_q), size=a.stream, p=p)]
-            log(f"\n=== Zipf s = {z:g}" + (f"   [migrate tới khi xong, nền xong trước lượt {finish}]" if finish
-                                             else (f"   [cấu hình churn {suffix[1:]}]" if suffix else "")))
+            log(f"\n=== Zipf s = {z:g}" + (f"   [migrate tới khi xong, nền xong trước lượt {finish}"
+                                             + (f", gỡ E0 đúng ở lượt {finish}]" if a.finish_drop == "T" else "]")
+                                             if finish else (f"   [cấu hình churn {suffix[1:]}]" if suffix else "")))
             done = {}
             plan = []
             for pol_full in pols:
@@ -1061,8 +1146,10 @@ def main():
                 tt.update(rec["_r11"])                           # đợt 11: byte, rep_curve (trường mới, số cũ không đổi)
                 if KCONF_RE.match(pol):
                     tt["confirm_k"] = c
+                    tt["confirm_kind"] = cpred(pol)[0]            # đợt 12
                 if finish and is_bg_policy(pol):
                     tt["bg_finish"] = finish
+                    tt["finish_drop"] = a.finish_drop             # đợt 12
                 if pol == "full":
                     tt["reembed_t0"] = int(N - nS)
                 if pol in ("mapall", "mapkeep"):
@@ -1081,7 +1168,10 @@ def main():
                 if finish or pol in ("lazybg", "rebuild") or DCAP_RE.match(pol):
                     m_ = rec["_mig"]
                     log(f"     xong ở lượt {m_['t_done']}, lưu trữ đỉnh {m_['store_peak']:.1f}% (TB {m_['store_mean']:.1f}%), "
-                        f"dual đỉnh {m_['dual_peak']:.1f}%, retire do trần {m_['cap_retired']}, gỡ E0 khi xong {m_['e0_dropped']}")
+                        f"dual đỉnh {m_['dual_peak']:.1f}%, retire do trần {m_['cap_retired']}, gỡ E0 khi xong {m_['e0_dropped']}"
+                        + (f", gỡ E0 ở lượt {m_['t_drop']}" if m_["t_drop"] >= 0 else "")
+                        + (f", veto {tt['vetoes']}, xác nhận từ query mới {tt['conf_distinct']}"
+                           if cpred(pol) is not None and cpred(pol)[0] != "k" else ""))
                 if bmeta:                                       # đợt 11
                     m0_ = bmeta[0]
                     log(f"     byte/object (meta {m0_}): đầu {tt[f'bytes_t0_m{m0_}']:.0f}, đỉnh {tt[f'bytes_peak_m{m0_}']:.0f}, "
