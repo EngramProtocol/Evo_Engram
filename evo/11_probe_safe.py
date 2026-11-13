@@ -146,6 +146,13 @@ Bổ sung đợt 12 (mặc định không đổi gì của các chính sách cũ
             thấy từ query chưa từng thấy object đó, chỉ với u, uv), t_drop (lượt gỡ E0 khi --finish-drop T, ngược lại −1),
             confirm_kind (k, u, v, uv) cùng confirm_k, và finish_drop của run có nền khi --bg-finish.
 
+Bổ sung đợt 13 (không đổi gì của các chính sách và các run cũ):
+  lazyVbgDinf chạy được cả khi không có --bg-finish, tức trên dòng truy vấn không có hạn chót như ablation code100kfq của
+            đợt 11: không bao giờ retire bản E0 (drain trước khi xong). Ngân sách nền ghép như lazyVbgD, nhưng với lazyD
+            (công bố, không retire) thay cho lazyV<c>: tốc độ nền = (số record lazy công bố − số record lazyD công bố) /
+            số lượt, nên lazy và lazyD phải đứng trước nó trong --policies. Dùng để đo chi phí của drain trên cùng dòng
+            truy vấn với Bảng 10 của bản thảo (k1). Khi có --bg-finish, lazyVbgDinf chạy như đợt 11, 12.
+
 CHẠY: python3 evo/11_probe_safe.py --tag arctic --dataset code100kfq --seed 3 --nodes 50000 --frac 0.02
 """
 import argparse, importlib.util, json, os, random, re, time
@@ -1102,6 +1109,8 @@ def main():
                 ent = []
                 if finish and is_bg_policy(pol) and pol != "bgV":
                     ent.append((pol, pol, kconf(pol, confirms[0]) if pol.startswith("lazyV") else 0, None))
+                elif pol == "lazyVbgDinf" and not finish:      # đợt 13: drain trên dòng không có hạn chót
+                    ent.append((pol, pol, NEVER, ("lazy", "lazyD")))
                 elif finish_only(pol):
                     log(f"  ({pol_full} chỉ chạy với --bg-finish) bỏ qua")
                 elif pol == "lazyV":
