@@ -1,6 +1,6 @@
-# Đợt 7: thăm dò cho bản nâng cấp sau desk reject của JNCA
+# Đợt 7: thăm dò cho bản nâng cấp của bài
 
-JNCA từ chối bài ở vòng biên tập vì đóng góp mới và độ sâu kỹ thuật chưa đủ. Đợt này thăm dò ba hướng có thể
+Đợt này thăm dò ba hướng có thể
 thành đóng góp mới. Đây là pilot chưa đăng ký trước, không thuộc đánh giá xác nhận. Hướng nào cho tín hiệu rõ
 mới đưa vào một đợt xác nhận đăng ký trước sau đó.
 

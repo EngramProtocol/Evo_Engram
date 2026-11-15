@@ -139,17 +139,19 @@ The run logs of rounds 5 and 6 therefore show the earlier commits `1f60f31` and 
 identical, and the manifests pass at the current tags.
 
 Each manifest is meant to be checked at its own tag, where every file it lists matches. On `main`, the
-manifests of rounds 4, 5 and 7 to 12 no longer match the probes that later rounds extended, and the notes
-`evo/README_round14.md` and `evo/README_round15.md` differ from their manifests because the server address in
-them was replaced by `<server>`.
+manifests of rounds 4, 5 and 7 to 12 no longer match the probes that later rounds extended. Three files on
+`main` also differ from their manifests because notes and comments were edited after the runs: the server
+address in `evo/README_round14.md` and `evo/README_round15.md` was replaced by `<server>`, and the opening
+comment of `evo/run_round7.sh` was reworded.
 
 The development rounds that precede the confirmatory evaluation (`evo/run_gate*.sh`, `evo/run_round2.sh`,
 `evo/run_round3.sh`, `evo/run_round3b.sh`) were run before the code was frozen and are not tagged.
 
 ## Requirements
 
-The reported runs used one CPU server with 4 cores and 31 GB of memory, with Python 3 and the packages
-below. No GPU is required; the embedding steps can use one.
+The reported runs used one Linux server with 4 CPU cores and 31 GB of memory, with Python 3 and the packages
+below. No GPU is required; the embedding steps can use one. Installing `requirements.txt` takes under a
+minute; `requirements-embed.txt` takes longer because torch is a large download.
 
 ```bash
 python3 -m venv venv && source venv/bin/activate

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Đợt 7: thăm dò cho bản nâng cấp sau desk reject của JNCA (chưa đăng ký trước, không thuộc đánh giá xác nhận).
+# Đợt 7: thăm dò cho bản nâng cấp của bài (chưa đăng ký trước, không thuộc đánh giá xác nhận).
 #   A  Placement native (10_probe_placement.py) trên code100kfq x {bge-base, e5-large, Arctic, M0} x seed 3 4 5,
 #      50.000 node: SRP như bài, SRP trừ tâm, PCA và ITQ học trên mẫu S với ngưỡng trung vị; L = 5, 10 bảng,
 #      T = 2, 4, 8, 16 probe; recall, số ứng viên, số peer, tải lưu trữ và tải truy vấn theo peer.

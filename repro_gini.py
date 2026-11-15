@@ -57,7 +57,7 @@ if __name__ == '__main__':
         print(f"  {ds} seed={s:<9} Gini={res[s]:.4f}  total={c.sum():,}  "
               f"mean={c.mean():.2f} P95={np.percentile(c,95):.0f} "
               f"P99={np.percentile(c,99):.0f} max={c.max()}", flush=True)
-    json.dump({str(k): v for k, v in res.items()}, open(f'/home/claude/gini_{ds}.json','w'))
+    json.dump({str(k): v for k, v in res.items()}, open(f'gini_{ds}.json','w'))
     z5  = [res[s] for s in [20235956,1,2,3,4]]
     z3  = [res[s] for s in [20235956,1,2]]
     all10 = [res[s] for s in seeds]
