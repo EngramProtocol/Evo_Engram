@@ -40,11 +40,12 @@ src/        discrete-event Kademlia overlay (SimPy): network, node and routing m
 data/       corpora, embeddings, ground truth and PQ codebooks (not in git, see "Data")
 ```
 
-The other files at the top level (`main_simulation*.py`, `run_*.sh`, `analyze_*.py`, figures) come from the
-overlay-simulator project from which `src/` was taken (tag `base-v1.0-cc`); its documentation is kept in
-`README_vengram_base.md`. They are not needed for the Evo-Engram results. `README_round4.md` and the
-top-level `SHA256SUMS_*` files are historical notes and checksum lists of the round-4 code package; two of
-these lists predate the final paraphrase prompt and no longer match `prepare/04_evo_colab_embed.py`.
+The overlay simulator in `src/` comes from the V-Engram project. Tag `base-v1.0-cc` holds it together with
+that project's experiment scripts and documentation, which the Evo-Engram results do not use and which are no
+longer on `main`; comments and messages in `evo/` and `prepare/` that name V-Engram scripts, such as
+`main_churn_engine.py`, refer to files at that tag. `README_round4.md` and the top-level `SHA256SUMS_*`
+files are historical notes and checksum lists of the round-4 code package; two of these lists predate the
+final paraphrase prompt and no longer match `prepare/04_evo_colab_embed.py`.
 
 Code comments, log messages, the round notes (`evo/README_round*.md`, `evo/RUN.md`) and the preregistrations
 (`evo/PREREG_round*.md`) are in Vietnamese. This README summarizes them, the manuscript describes the
@@ -113,7 +114,7 @@ code and requires every number to match.
 
 | tag | commit | round | content | criteria met |
 |---|---|---|---|---|
-| `base-v1.0-cc` | `4c290c8` | | overlay simulator before any Evo-Engram code | |
+| `base-v1.0-cc` | `4c290c8` | | V-Engram overlay simulator and experiment scripts, before any Evo-Engram code | |
 | `evo-confirm-v1` | `20e303e` | 4 | confirmatory evaluation of the supporting components (adapter, fusion rule, refitting, lazy order) and its exploratory parts | 15/20 |
 | `evo-r5-v1` | `84453a2` | 5 | exploratory: adapters fitted on PQ reconstructions; recall under simulated iterative lookups | |
 | `evo-r6-v1` | `e1cd33d` | 6 | exploratory: migration schedule replay, seven more bge-base seeds, PQ adapters with simulated lookups | |
