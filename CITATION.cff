@@ -20,9 +20,11 @@ authors:
   - given-names: Mau-Tra
     family-names: Nguyen
     affiliation: "School of Information and Communication Technology, Hanoi University of Science and Technology; A-Star Group JSC"
+    orcid: "https://orcid.org/0009-0000-2086-7136"
   - given-names: Binh Minh
     family-names: Nguyen
     affiliation: "School of Information and Communication Technology, Hanoi University of Science and Technology; Institute for Digital Technology and Economy, Hanoi University of Science and Technology"
+    orcid: "https://orcid.org/0000-0003-1328-3647"
 keywords:
   - decentralized semantic search
   - distributed hash tables

@@ -138,6 +138,11 @@ The tags `evo-r5-v1` and `evo-r6-v1` were re-created on 22 October 2026 after th
 The run logs of rounds 5 and 6 therefore show the earlier commits `1f60f31` and `19c1933`; the files are
 identical, and the manifests pass at the current tags.
 
+Each manifest is meant to be checked at its own tag, where every file it lists matches. On `main`, the
+manifests of rounds 4, 5 and 7 to 12 no longer match the probes that later rounds extended, and the notes
+`evo/README_round14.md` and `evo/README_round15.md` differ from their manifests because the server address in
+them was replaced by `<server>`.
+
 The development rounds that precede the confirmatory evaluation (`evo/run_gate*.sh`, `evo/run_round2.sh`,
 `evo/run_round3.sh`, `evo/run_round3b.sh`) were run before the code was frozen and are not tagged.
 

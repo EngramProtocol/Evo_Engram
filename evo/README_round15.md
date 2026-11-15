@@ -162,5 +162,5 @@ file V 60/60, W 40/40, R 1/1, file placement học của đợt 14 100/100.
 Lấy file về laptop (chạy trên laptop, một đích duy nhất):
 
 ```bash
-scp research@103.67.203.71:~/evo_round15_results.tar.gz ~/Downloads/
+scp <server>:~/evo_round15_results.tar.gz ~/Downloads/
 ```

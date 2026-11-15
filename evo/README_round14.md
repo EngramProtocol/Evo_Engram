@@ -218,5 +218,5 @@ khi rebuild xong ở mọi checkpoint; thống kê bit của pha O trùng `probe
 Lấy file về laptop (chạy trên laptop, một đích duy nhất):
 
 ```bash
-scp research@103.67.203.71:~/evo_round14_results.tar.gz ~/Downloads/
+scp <server>:~/evo_round14_results.tar.gz ~/Downloads/
 ```
