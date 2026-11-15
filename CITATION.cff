@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Evo-Engram: simulation and analysis code for embedding model migration in a semantic distributed hash table"
+type: software
+version: 1.0.0
+license: MIT
+repository-code: "https://github.com/EngramProtocol/Evo_Engram"
+abstract: >-
+  Simulation and analysis code for Evo-Engram, a design for replacing the
+  embedding model of a semantic distributed hash table while the index stays
+  searchable. The repository contains retrieval probes, placement and
+  migration simulators, a discrete-event Kademlia overlay simulator, data
+  preparation scripts for CodeSearchNet and SciFact, the preregistration and
+  checksum manifest of each evaluation round, and the analysis scripts that
+  print the reported results. Each evaluation round is frozen at a git tag.
+authors:
+  - given-names: Nam-Khanh
+    family-names: Tran
+    affiliation: "School of Information and Communication Technology, Hanoi University of Science and Technology"
+  - given-names: Mau-Tra
+    family-names: Nguyen
+    affiliation: "School of Information and Communication Technology, Hanoi University of Science and Technology; A-Star Group JSC"
+  - given-names: Binh Minh
+    family-names: Nguyen
+    affiliation: "School of Information and Communication Technology, Hanoi University of Science and Technology; Institute for Digital Technology and Economy, Hanoi University of Science and Technology"
+keywords:
+  - decentralized semantic search
+  - distributed hash tables
+  - embedding model migration
+  - locality-sensitive hashing
+  - learned placement
+  - load balancing
