@@ -1,5 +1,7 @@
 # Evo-Engram
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24274187.svg)](https://doi.org/10.5281/zenodo.24274187)
+
 Code for the experiments in the manuscript *Coordinating record placement and retirement limits recall loss
 when a decentralized semantic index changes its embedding model*, by Nam-Khanh Tran, Mau-Tra Nguyen and
 Binh Minh Nguyen.
@@ -150,8 +152,8 @@ The development rounds that precede the confirmatory evaluation (`evo/run_gate*.
 
 ## Requirements
 
-The reported runs used one Linux server with 4 CPU cores and 31 GB of memory, with Python 3 and the packages
-below. No GPU is required; the embedding steps can use one. Installing `requirements.txt` takes under a
+The reported runs used one server with 4 CPU cores and 31 GB of memory, running Ubuntu 24.04 LTS with
+Python 3.12.3 and the packages below. No GPU is required; the embedding steps can use one. Installing `requirements.txt` takes under a
 minute; `requirements-embed.txt` takes longer because torch is a large download.
 
 ```bash
@@ -394,4 +396,8 @@ are not part of this repository and remain under their own licenses.
 ## Citation
 
 If you use this code, please cite the manuscript; the reference will be added here once it is published.
-To cite the code itself, use the metadata in `CITATION.cff`, which GitHub shows under "Cite this repository".
+
+The code is archived on Zenodo. Version 1.0.0, the version used for the manuscript, has the DOI
+[10.5281/zenodo.24274188](https://doi.org/10.5281/zenodo.24274188); the DOI
+[10.5281/zenodo.24274187](https://doi.org/10.5281/zenodo.24274187) covers all versions and resolves to the
+latest one. `CITATION.cff` holds the citation metadata, which GitHub shows under "Cite this repository".
