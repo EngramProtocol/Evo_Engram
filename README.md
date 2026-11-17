@@ -2,8 +2,8 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24274187.svg)](https://doi.org/10.5281/zenodo.24274187)
 
-Code for the experiments in the manuscript *Coordinating record placement and retirement limits recall loss
-when a decentralized semantic index changes its embedding model*, by Nam-Khanh Tran, Mau-Tra Nguyen and
+Code and experiment record for the manuscript *Coordinated record placement and retirement mitigate recall loss
+during embedding model migration in decentralized semantic indexes*, by Nam-Khanh Tran, Mau-Tra Nguyen and
 Binh Minh Nguyen.
 
 In a semantic distributed hash table (DHT), the embedding of an object decides both how its index records
@@ -15,10 +15,12 @@ migration design for this setting in which clients run only the new model $M_1$.
   how unevenly sign random projection (SRP) keys will load the peers, and the query bucket fraction $q_f$,
   the share of the corpus that falls into the bucket of a query's own key. A threshold on $q_f$ chooses
   between the original SRP keys and learned placement.
-- **Learned placement with a load cap (C2).** The keys of the new epoch are learned on the same sample (ITQ
-  with median thresholds). Each peer takes at most 16 times the mean load of a table, and an overflowing
-  record goes to another of the $K = 20$ peers closest to its key, so keys, routing and the number of
-  contacted peers stay unchanged.
+- **Learned placement with a soft load cap (C2).** The keys of the new epoch are learned on the same sample
+  (ITQ with median thresholds). A peer should hold at most 16 times the mean load of a table: an overflowing
+  record goes to the first peer with free capacity among the $K = 20$ peers closest to its key, or to the
+  least loaded of them when all are full, so keys, routing and the number of contacted peers stay unchanged.
+  The cap is soft; under learned keys it was exceeded for at most 0.66% of the records of a placement
+  (`experiments/E2_learned_placement.md`).
 - **Dual migration (C3).** The legacy record of a re-embedded object is kept, with the new PQ code attached,
   until the legacy epoch is drained, while the rest of the corpus is migrated in the background. Rules that
   retire legacy records earlier, after sightings through the new keys, are evaluated against it.
@@ -28,15 +30,16 @@ probabilistic rule (PROB) that merges the candidate lists of the two index epoch
 of the design, evaluated in rounds 4 to 6. The current design uses them as infrastructure.
 
 All results come from simulation. The repository contains the retrieval probes, the placement and migration
-simulators, a discrete-event Kademlia overlay simulator, the data preparation scripts, the preregistration
-and checksum manifest of each evaluation round, and the analysis scripts that print the numbers reported in
-the manuscript.
+simulators, a discrete-event Kademlia overlay simulator, the data preparation scripts, the prespecified
+protocol and checksum manifest of each evaluation round, the analysis scripts that print the numbers reported
+in the manuscript, and a record of every experiment with its complete results ([`experiments/`](experiments/README.md)).
 
 ## Layout
 
 ```
 evo/        Evo-Engram experiments: probes, simulators, run scripts, analysis scripts,
-            preregistrations, round notes and checksum manifests
+            prespecified protocols, round notes and checksum manifests
+experiments/ record of the experiments E1 to E9: question, rounds, analysis scripts and complete results
 prepare/    corpus construction and embedding (CodeSearchNet, SciFact, fresh queries, paraphrases)
 src/        discrete-event Kademlia overlay (SimPy): network, node and routing models
 data/       corpora, embeddings, ground truth and PQ codebooks (not in git, see "Data")
@@ -49,10 +52,10 @@ longer on `main`; comments and messages in `evo/` and `prepare/` that name V-Eng
 files are historical notes and checksum lists of the round-4 code package; two of these lists predate the
 final paraphrase prompt and no longer match `prepare/04_evo_colab_embed.py`.
 
-Code comments, log messages, the round notes (`evo/README_round*.md`, `evo/RUN.md`) and the preregistrations
+Code comments, log messages, the round notes (`evo/README_round*.md`, `evo/RUN.md`) and the protocols
 (`evo/PREREG_round*.md`) are in Vietnamese. This README summarizes them, the manuscript describes the
-hypotheses and their pass criteria in English, and the section "Reading the logs" translates the status
-words that the scripts print.
+hypotheses and their pass criteria in English, the experiment record in `experiments/` gives the complete
+results in English, and the section "Reading the logs" translates the status words that the scripts print.
 
 ### Scripts in `evo/`
 
@@ -94,7 +97,7 @@ with any mismatch, into `evo/round<N>_all.txt`.
 | | `itq<k>_q` | ITQ on $k$ principal components, 63 bits kept |
 | | `<v>+cap<m>`, `_cap<m>` in file names | placement `<v>` with each peer capped at $m$ times the mean load of a table |
 
-Migration policies, as named in the manuscript (Supplementary Table S50) and in the code:
+Migration policies, as named in the manuscript and in the code (`experiments/setup.md` describes each one):
 
 | manuscript | code |
 |---|---|
@@ -110,7 +113,9 @@ Migration policies, as named in the manuscript (Supplementary Table S50) and in 
 Each evaluation round is frozen at a tag. The run script of a round stops if a file listed in the round's
 checksum manifest has changed. Round `<N>` has the run script `evo/run_round<N>.sh` and the manifest
 `evo/SHA256SUMS_round<N>`; rounds 5 to 15 have a note `evo/README_round<N>.md`; and the confirmatory rounds
-have a preregistration `evo/PREREG_round<N>.md`, committed with the tag before any job of the round was run.
+have a protocol `evo/PREREG_round<N>.md`, committed with the tag before any job of the round was run. The
+manuscript calls these internal prespecified protocols, since they were not filed with an external registry;
+the file names and the tags (`PREREG`, `-prereg`) keep the name they had when the rounds were run.
 From round 8 on, each round includes a regression phase R that reruns jobs of an earlier round with the new
 code and requires every number to match.
 
@@ -133,9 +138,12 @@ code and requires every number to match.
 | `evo-r15-prereg` | `fd561ec` | 15 | H25: C3 to completion on the original SRP keys; exploratory: two more models, equal progress, a background twice as fast | 68/68 |
 
 Round 4 numbers its hypotheses H1 to H4 in `evo/PREREG_round4.md`; the manuscript calls them S1 to S4 to keep
-them apart from H1 to H25 of rounds 8 to 15. Round 13 is exploratory and has no preregistration, although
+them apart from H1 to H25 of rounds 8 to 15. Round 13 is exploratory and has no protocol file, although
 its tag carries the same suffix as the others; the rules for reading its results were fixed in
 `evo/README_round13.md` at the tag, before the run.
+
+Release `v1.0.0` (commit `94c68f7`) is the code used for the manuscript. Release `v1.1.0` adds the experiment
+record in `experiments/` and updates this README and `CITATION.cff`; the code is unchanged.
 
 The tags `evo-r5-v1` and `evo-r6-v1` were re-created on 22 October 2026 after the commit messages were edited.
 The run logs of rounds 5 and 6 therefore show the earlier commits `1f60f31` and `19c1933`; the files are
@@ -328,7 +336,7 @@ The times are the estimates written in the round notes before each run, with fou
 | printed | meaning |
 |---|---|
 | `ĐẠT`, `KHÔNG ĐẠT`, `KHÔNG CHẠY` | criterion met, not met, not run |
-| `TÓM TẮT ĐÁNH GIÁ` | summary of the preregistered criteria |
+| `TÓM TẮT ĐÁNH GIÁ` | summary of the prespecified criteria |
 | `THĂM DÒ` | exploratory analysis |
 | `ĐỌC` | reading of an exploratory result under rules fixed before the run |
 | `Tự kiểm` | self-checks |
@@ -340,27 +348,27 @@ The times are the estimates written in the round notes before each run, with fou
 
 ## Mapping to the manuscript
 
-Figure and table numbers refer to the submitted manuscript and its Supplementary Information. After the runs,
-return to the branch head (`git checkout main`) and run the analysis scripts in the repository root. The
+Figure and table numbers without a letter refer to the manuscript; tables and figures numbered E1.1 to E9.14
+are in the experiment record ([`experiments/`](experiments/README.md)). After the runs, return to the branch head (`git checkout main`) and run the analysis scripts in the repository root. The
 analysis scripts of rounds 7 to 15 on `main` are identical to those at the round tags. They read the result
 files of their round, and of earlier rounds where they compare. From round 8 on, they take the seed and model
 lists from the same environment variables as the run scripts, with the values of the round as defaults, so
-files of other rounds with the same prefix are not mixed in. Figures 2 to 4 and Supplementary Figures S1 to
-S3 plot values printed by these scripts.
+files of other rounds with the same prefix are not mixed in. Figures 2 to 4 of the manuscript and Figures E9.1
+to E9.3 of the record plot values printed by these scripts.
 
 ### Contributions C1 to C3 (rounds 7 to 15)
 
 | round | command | manuscript |
 |---|---|---|
-| 7, 7b | `python3 evo/analyze_r7.py`, `python3 evo/analyze_r7b.py`, run before round 8, which writes `probeP_*` and `probeA_*` files for seeds 6 to 8 that these scripts would also read | pilots, listed in Supplementary Table S51 |
-| 8 | `python3 evo/analyze_r8.py` | H1 to H5: collision model on three corpora (Supplementary Table S1); learned placement against SRP (Table 1, Supplementary Table S2); C3 and map-all on code 100k (Results; Supplementary Tables S6, S8) |
-| 9 | `python3 evo/analyze_r9.py` | H6 to H8: C3 on code 20k and SciFact (Supplementary Table S7); map-keep (Supplementary Table S8); churn and peer failures (Supplementary Table S12); ITQ on more components (Supplementary Table S3) |
-| 10 | `python3 evo/analyze_r10.py` | H9, H10: load cap (Table 1, Supplementary Table S2); C3 on capped placement (Supplementary Table S6) |
-| 11 | `python3 evo/analyze_r11.py` | H11: each part of dual migration (Table 2) and stream costs (Table 4); H12: completion against rebuild and draining (Supplementary Table S9); H13 to H16: mechanism of C2, C1 on new pairs and the new model families (Table 1, Supplementary Tables S1, S4); placements at equal probes (Supplementary Table S27); H17 and payload by query repetition (Supplementary Tables S11, S43); churn (Supplementary Table S12); lost paths and negative flips (Supplementary Table S48); the pairs from which the placement rule was derived (Fig. 2b) |
-| 12 | `python3 evo/analyze_r12.py` | H18: retirement rules (Fig. 3, Supplementary Tables S10, S45); H19: placement rule (Fig. 2b, Table 1, Supplementary Table S5); H20, H21: C2 and C1 on five new models (Table 1, Supplementary Tables S1, S4, S49) |
-| 13 | `python3 evo/analyze_r13.py` | collision quantities estimated from $S$ and the validation queries (Fig. 2a, Table 1, Supplementary Table S1); lookup reach by XOR rank (Supplementary Table S26); drain on the code 100k stream (Table 4, Supplementary Tables S43, S48) |
-| 14 | `python3 evo/analyze_r14.py` | H22: drain to completion on new seeds (Supplementary Table S31); H23 (Supplementary Tables S28, S29); H24: C3 on the original SRP keys (Supplementary Tables S30, S42); full with 16 probes per table (Table 4); churn with drain (Supplementary Table S32); 5,000 peers (Supplementary Table S33); drain in Supplementary Table S48 |
-| 15 | `python3 evo/analyze_r15.py` | H25 (Table 3, Supplementary Tables S34, S35); the old path against $q_f$ (Fig. 4, Supplementary Table S41); every policy (Supplementary Tables S36, S37); equal progress and a faster background (Supplementary Tables S38, S39); Arctic and MiniLM (Supplementary Table S40) |
+| 7, 7b | `python3 evo/analyze_r7.py`, `python3 evo/analyze_r7b.py`, run before round 8, which writes `probeP_*` and `probeA_*` files for seeds 6 to 8 that these scripts would also read | pilots, listed in [`experiments/setup.md`](experiments/setup.md#evaluation-rounds) |
+| 8 | `python3 evo/analyze_r8.py` | H1 to H5: collision model on three corpora ([Table E1.1](experiments/E1_collision_model.md#table-e11)); learned placement against SRP (Table 1, [Table E2.1](experiments/E2_learned_placement.md#table-e21)); C3 and map-all on code 100k (Results; [Table E3.1](experiments/E3_retiring_at_publication.md#table-e31), [Table E8.1](experiments/E8_mapping_baselines.md#table-e81)) |
+| 9 | `python3 evo/analyze_r9.py` | H6 to H8: C3 on code 20k and SciFact ([Table E3.2](experiments/E3_retiring_at_publication.md#table-e32)); map-keep ([Table E8.1](experiments/E8_mapping_baselines.md#table-e81)); churn and peer failures ([Table E7.2](experiments/E7_costs_and_churn.md#table-e72)); ITQ on more components ([Table E2.2](experiments/E2_learned_placement.md#table-e22)) |
+| 10 | `python3 evo/analyze_r10.py` | H9, H10: load cap (Table 1, [Table E2.1](experiments/E2_learned_placement.md#table-e21)); C3 on capped placement ([Table E3.1](experiments/E3_retiring_at_publication.md#table-e31)) |
+| 11 | `python3 evo/analyze_r11.py` | H11: each part of dual migration (Table 2) and stream costs (Table 4); H12: completion against rebuild and draining ([Table E5.1](experiments/E5_migration_to_completion.md#table-e51)); H13 to H16: mechanism of C2, C1 on new pairs and the new model families (Table 1, [Table E1.1](experiments/E1_collision_model.md#table-e11), [Table E2.3](experiments/E2_learned_placement.md#table-e23)); placements at equal probes ([Table E2.5](experiments/E2_learned_placement.md#table-e25)); H17 and payload by query repetition ([Table E7.1](experiments/E7_costs_and_churn.md#table-e71), [Table E7.4](experiments/E7_costs_and_churn.md#table-e74)); churn ([Table E7.2](experiments/E7_costs_and_churn.md#table-e72)); lost paths and negative flips ([Table E3.3](experiments/E3_retiring_at_publication.md#table-e33)); the pairs from which the placement rule was derived (Fig. 2b) |
+| 12 | `python3 evo/analyze_r12.py` | H18: retirement rules (Fig. 3, [Table E5.2](experiments/E5_migration_to_completion.md#table-e52), [Table E5.4](experiments/E5_migration_to_completion.md#table-e54)); H19: placement rule (Fig. 2b, Table 1, [Table E1.2](experiments/E1_collision_model.md#table-e12)); H20, H21: C2 and C1 on five new models (Table 1, [Table E1.1](experiments/E1_collision_model.md#table-e11), [Table E2.3](experiments/E2_learned_placement.md#table-e23), [Embedding spaces](experiments/setup.md#embedding-spaces)) |
+| 13 | `python3 evo/analyze_r13.py` | collision quantities estimated from $S$ and the validation queries (Fig. 2a, Table 1, [Table E1.1](experiments/E1_collision_model.md#table-e11)); lookup reach by XOR rank ([Table E2.4](experiments/E2_learned_placement.md#table-e24)); drain on the code 100k stream (Table 4, [Table E7.4](experiments/E7_costs_and_churn.md#table-e74), [Table E3.3](experiments/E3_retiring_at_publication.md#table-e33)) |
+| 14 | `python3 evo/analyze_r14.py` | H22: drain to completion on new seeds ([Table E5.3](experiments/E5_migration_to_completion.md#table-e53)); H23 ([Table E4.1](experiments/E4_parts_of_dual_migration.md#table-e41), [Table E4.2](experiments/E4_parts_of_dual_migration.md#table-e42)); H24: C3 on the original SRP keys ([Table E6.1](experiments/E6_original_srp_keys.md#table-e61), [Table E6.10](experiments/E6_original_srp_keys.md#table-e610)); full with 16 probes per table (Table 4); churn with drain ([Table E7.3](experiments/E7_costs_and_churn.md#table-e73)); 5,000 peers ([Table E2.6](experiments/E2_learned_placement.md#table-e26)); drain in [Table E3.3](experiments/E3_retiring_at_publication.md#table-e33) |
+| 15 | `python3 evo/analyze_r15.py` | H25 (Table 3, [Table E6.2](experiments/E6_original_srp_keys.md#table-e62), [Table E6.3](experiments/E6_original_srp_keys.md#table-e63)); the old path against $q_f$ (Fig. 4, [Table E6.9](experiments/E6_original_srp_keys.md#table-e69)); every policy ([Table E6.4](experiments/E6_original_srp_keys.md#table-e64), [Table E6.5](experiments/E6_original_srp_keys.md#table-e65)); equal progress and a faster background ([Table E6.6](experiments/E6_original_srp_keys.md#table-e66), [Table E6.7](experiments/E6_original_srp_keys.md#table-e67)); Arctic and MiniLM ([Table E6.8](experiments/E6_original_srp_keys.md#table-e68)) |
 
 ### Supporting components (rounds 4 to 6)
 
@@ -370,17 +378,17 @@ development results apart; the scripts average every file that matches.
 | manuscript | command |
 |---|---|
 | model transitions (angle, top-5 overlap); fresh-query and paraphrase statistics | printed by `evo/07_assemble_data.py` (`evo/assemble_round4.log`) and `prepare/04_evo_colab_embed.py` (`$OUT/log_colab.txt`, `$OUT/fresh_queries.json`) |
-| outcomes against the preregistered criteria S1 to S4 (Supplementary Table S44) | `python3 evo/analyze_prereg.py` |
-| S1: adapter versus dual encoder on held-out queries (Supplementary Table S13) | `python3 evo/analyze_03.py "probeH_code100kfq_*_ho1.json"` and `python3 evo/analyze_03.py "probeH_arctic_*_ho1.json" "probeH_scifact_arctic_*_ho1.json"` |
-| S2, S3: recall versus migrated fraction, multi-epoch outcomes, fusion baselines (PROB, RRF, CAL, SD, PROP), native index against the legacy path (Supplementary Fig. S1, Tables S14, S15, S17) | `python3 evo/analyze_04b.py "probeG_code100kfq_*_s[0-9].json"` and `python3 evo/analyze_04b.py "probeG_arctic_s[0-9].json" "probeG_scifact_arctic_s[0-9].json"`; development rows: `python3 evo/analyze_04b.py "probeG_bgebase_s*.json" "probeG_e5large_s*.json"` |
-| adapters fitted on PQ reconstructions (Supplementary Methods) | `python3 evo/analyze_r5.py a` |
-| S4: Zipf stream and recall over the stream (Supplementary Table S16, Fig. S2) | `python3 evo/analyze_06.py "probeL_code100kfq_*_ku.json"` and `python3 evo/analyze_06.py "probeL_arctic_*_ku.json" "probeL_scifact_arctic_*_ku.json"` |
-| paraphrase workload, re-indexer limits (Supplementary Tables S18, S19) | `python3 evo/analyze_06b.py "probeLR_*.json"` |
-| simulated network and computation costs, fixed states and stream (Supplementary Tables S20, S21) | `python3 evo/analyze_08.py "probeS_*.json"` |
-| client CPU time and model memory (Supplementary Methods) | `bench_<tag>.json` (written by `evo/05_bench_cpu.py`) |
-| recall under simulated iterative lookup, fixed states and stream (Supplementary Tables S22, S23) | `python3 evo/analyze_r5.py b`, run before round 6 or in a directory that holds only `probeE2E_*[0-9].json` (round 6 adds `probeE2E_*_pq.json`, which this script would also average) |
-| schedule replay, ten bge-base seeds, PQ adapters with simulated lookups (Supplementary Table S24) | `python3 evo/analyze_r6.py` |
-| first-order accounting of lazy versus background migration (Supplementary Table S25, Fig. S3) | `python3 evo/analyze_accounting.py` |
+| outcomes against the prespecified criteria S1 to S4 ([Table E9.14](experiments/E9_supporting_components.md#table-e914)) | `python3 evo/analyze_prereg.py` |
+| S1: adapter versus dual encoder on held-out queries ([Table E9.1](experiments/E9_supporting_components.md#table-e91)) | `python3 evo/analyze_03.py "probeH_code100kfq_*_ho1.json"` and `python3 evo/analyze_03.py "probeH_arctic_*_ho1.json" "probeH_scifact_arctic_*_ho1.json"` |
+| S2, S3: recall versus migrated fraction, multi-epoch outcomes, fusion baselines (PROB, RRF, CAL, SD, PROP), native index against the legacy path ([Figure E9.1](experiments/E9_supporting_components.md#figure-e91), [Table E9.2](experiments/E9_supporting_components.md#table-e92), [Table E9.3](experiments/E9_supporting_components.md#table-e93), [Table E9.5](experiments/E9_supporting_components.md#table-e95)) | `python3 evo/analyze_04b.py "probeG_code100kfq_*_s[0-9].json"` and `python3 evo/analyze_04b.py "probeG_arctic_s[0-9].json" "probeG_scifact_arctic_s[0-9].json"`; development rows: `python3 evo/analyze_04b.py "probeG_bgebase_s*.json" "probeG_e5large_s*.json"` |
+| adapters fitted on PQ reconstructions ([E9](experiments/E9_supporting_components.md)) | `python3 evo/analyze_r5.py a` |
+| S4: Zipf stream and recall over the stream ([Table E9.4](experiments/E9_supporting_components.md#table-e94), [Figure E9.2](experiments/E9_supporting_components.md#figure-e92)) | `python3 evo/analyze_06.py "probeL_code100kfq_*_ku.json"` and `python3 evo/analyze_06.py "probeL_arctic_*_ku.json" "probeL_scifact_arctic_*_ku.json"` |
+| paraphrase workload, re-indexer limits ([Table E9.6](experiments/E9_supporting_components.md#table-e96), [Table E9.7](experiments/E9_supporting_components.md#table-e97)) | `python3 evo/analyze_06b.py "probeLR_*.json"` |
+| simulated network and computation costs, fixed states and stream ([Table E9.8](experiments/E9_supporting_components.md#table-e98), [Table E9.9](experiments/E9_supporting_components.md#table-e99)) | `python3 evo/analyze_08.py "probeS_*.json"` |
+| client CPU time and model memory ([E9](experiments/E9_supporting_components.md)) | `bench_<tag>.json` (written by `evo/05_bench_cpu.py`) |
+| recall under simulated iterative lookup, fixed states and stream ([Table E9.10](experiments/E9_supporting_components.md#table-e910), [Table E9.11](experiments/E9_supporting_components.md#table-e911)) | `python3 evo/analyze_r5.py b`, run before round 6 or in a directory that holds only `probeE2E_*[0-9].json` (round 6 adds `probeE2E_*_pq.json`, which this script would also average) |
+| schedule replay, ten bge-base seeds, PQ adapters with simulated lookups ([Table E9.12](experiments/E9_supporting_components.md#table-e912)) | `python3 evo/analyze_r6.py` |
+| first-order accounting of lazy versus background migration ([Table E9.13](experiments/E9_supporting_components.md#table-e913), [Figure E9.3](experiments/E9_supporting_components.md#figure-e93)) | `python3 evo/analyze_accounting.py` |
 
 The development-corpus rows come from several sources: the native-index and accounting rows from the
 development rounds (`probeG_<tag>_s<seed>.json`, `probeL_<tag>_s<seed>_ku.json`), the 20k cost rows from the
@@ -397,7 +405,8 @@ are not part of this repository and remain under their own licenses.
 
 If you use this code, please cite the manuscript; the reference will be added here once it is published.
 
-The code is archived on Zenodo. Version 1.0.0, the version used for the manuscript, has the DOI
-[10.5281/zenodo.24274188](https://doi.org/10.5281/zenodo.24274188); the DOI
-[10.5281/zenodo.24274187](https://doi.org/10.5281/zenodo.24274187) covers all versions and resolves to the
-latest one. `CITATION.cff` holds the citation metadata, which GitHub shows under "Cite this repository".
+The repository is archived on Zenodo, where each release has its own DOI. Version 1.0.0, the code used for
+the manuscript, has the DOI [10.5281/zenodo.24274188](https://doi.org/10.5281/zenodo.24274188); version 1.1.0
+adds the experiment record. The DOI [10.5281/zenodo.24274187](https://doi.org/10.5281/zenodo.24274187) covers
+all versions and resolves to the latest one. `CITATION.cff` holds the citation metadata, which GitHub shows
+under "Cite this repository".

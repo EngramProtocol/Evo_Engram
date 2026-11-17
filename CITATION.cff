@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: "Evo-Engram: simulation and analysis code for embedding model migration in a semantic distributed hash table"
 type: software
-version: 1.0.0
-date-released: 2026-11-16
+version: 1.1.0
+date-released: 2026-11-17
 doi: 10.5281/zenodo.24274187
 identifiers:
   - type: doi
@@ -11,7 +11,7 @@ identifiers:
     description: "All versions on Zenodo; resolves to the latest version"
   - type: doi
     value: 10.5281/zenodo.24274188
-    description: "Version 1.0.0, used for the manuscript"
+    description: "Version 1.0.0, the code used for the manuscript"
 license: MIT
 repository-code: "https://github.com/EngramProtocol/Evo_Engram"
 abstract: >-
@@ -19,9 +19,10 @@ abstract: >-
   embedding model of a semantic distributed hash table while the index stays
   searchable. The repository contains retrieval probes, placement and
   migration simulators, a discrete-event Kademlia overlay simulator, data
-  preparation scripts for CodeSearchNet and SciFact, the preregistration and
-  checksum manifest of each evaluation round, and the analysis scripts that
-  print the reported results. Each evaluation round is frozen at a git tag.
+  preparation scripts for CodeSearchNet and SciFact, the prespecified protocol
+  and checksum manifest of each evaluation round, the analysis scripts that
+  print the reported results, and a record of every experiment with its
+  complete results (experiments/). Each evaluation round is frozen at a git tag.
 authors:
   - given-names: Nam-Khanh
     family-names: Tran
