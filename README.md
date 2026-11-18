@@ -33,6 +33,8 @@ All results come from simulation. The repository contains the retrieval probes, 
 simulators, a discrete-event Kademlia overlay simulator, the data preparation scripts, the prespecified
 protocol and checksum manifest of each evaluation round, the analysis scripts that print the numbers reported
 in the manuscript, and a record of every experiment with its complete results ([`experiments/`](experiments/README.md)).
+The result files of the reported runs, with the logs and summaries of each round, are archived as a separate
+dataset ([10.5281/zenodo.24329447](https://doi.org/10.5281/zenodo.24329447)).
 
 ## Layout
 
@@ -356,6 +358,12 @@ lists from the same environment variables as the run scripts, with the values of
 files of other rounds with the same prefix are not mixed in. Figures 2 to 4 of the manuscript and Figures E9.1
 to E9.3 of the record plot values printed by these scripts.
 
+The reported numbers can also be recomputed without rerunning the simulations, from the archived result files
+([10.5281/zenodo.24329447](https://doi.org/10.5281/zenodo.24329447)): extract the archives of that dataset into
+the repository root and run the scripts below from there. Its README lists the archives that each experiment
+needs. The scripts then print the reported values; the only lines missing are a few excerpts of CodeSearchNet
+functions that `evo/analyze_r9.py` prints and the dataset leaves out.
+
 ### Contributions C1 to C3 (rounds 7 to 15)
 
 | round | command | manuscript |
@@ -406,7 +414,10 @@ are not part of this repository and remain under their own licenses.
 If you use this code, please cite the manuscript; the reference will be added here once it is published.
 
 The repository is archived on Zenodo, where each release has its own DOI. Version 1.0.0, the code used for
-the manuscript, has the DOI [10.5281/zenodo.24274188](https://doi.org/10.5281/zenodo.24274188); version 1.1.0
-adds the experiment record. The DOI [10.5281/zenodo.24274187](https://doi.org/10.5281/zenodo.24274187) covers
-all versions and resolves to the latest one. `CITATION.cff` holds the citation metadata, which GitHub shows
-under "Cite this repository".
+the manuscript, has the DOI [10.5281/zenodo.24274188](https://doi.org/10.5281/zenodo.24274188); version 1.1.0,
+which adds the experiment record and is the version cited in the manuscript, has the DOI
+[10.5281/zenodo.24313921](https://doi.org/10.5281/zenodo.24313921). The DOI
+[10.5281/zenodo.24274187](https://doi.org/10.5281/zenodo.24274187) covers all versions and resolves to the
+latest one. The raw outputs of the simulation runs are archived as a separate dataset with the DOI
+[10.5281/zenodo.24329447](https://doi.org/10.5281/zenodo.24329447). `CITATION.cff` holds the citation
+metadata, which GitHub shows under "Cite this repository".

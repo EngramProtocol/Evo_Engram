@@ -12,6 +12,9 @@ identifiers:
   - type: doi
     value: 10.5281/zenodo.24274188
     description: "Version 1.0.0, the code used for the manuscript"
+  - type: doi
+    value: 10.5281/zenodo.24313921
+    description: "Version 1.1.0, the code with the experiment record, cited by the manuscript"
 license: MIT
 repository-code: "https://github.com/EngramProtocol/Evo_Engram"
 abstract: >-
@@ -27,6 +30,7 @@ authors:
   - given-names: Nam-Khanh
     family-names: Tran
     affiliation: "School of Information and Communication Technology, Hanoi University of Science and Technology"
+    orcid: "https://orcid.org/0009-0000-0690-3436"
   - given-names: Mau-Tra
     family-names: Nguyen
     affiliation: "School of Information and Communication Technology, Hanoi University of Science and Technology; A-Star Group JSC"

@@ -27,4 +27,6 @@ of recall, and intervals are 95% t intervals over paired seeds. Code 100k, code 
 **Reproducing.** The repository README describes the data preparation, the run script of each round and the tag at
 which it is run. After the runs, return to `main` and run the analysis scripts named on each page from the repository
 root; they print the values in the tables, which are given here as printed. The scripts read the result files that
-the runs write to the repository root; these files are not tracked by git.
+the runs write to the repository root; these files are not tracked by git. The result files of the reported runs are
+archived as a separate dataset ([10.5281/zenodo.24329447](https://doi.org/10.5281/zenodo.24329447));
+extracting its archives into the repository root lets the scripts run without rerunning the simulations.
